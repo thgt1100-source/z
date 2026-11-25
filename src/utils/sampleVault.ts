@@ -1,0 +1,123 @@
+const DB_NAME = 'ark_lite_sample_vault_v1';
+const DB_VERSION = 1;
+const STORE_NAME = 'kv';
+const SAMPLES_RECORD_KEY = 'user_sample_images';
+
+function openVaultDb(): Promise<IDBDatabase | null> {
+  if (typeof indexedDB === 'undefined') return Promise.resolve(null);
+  return new Promise((resolve) => {
+    try {
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(STORE_NAME)) {
+          db.createObjectStore(STORE_NAME);
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+      req.onblocked = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+/**
+ * Mirrors user-assigned Style (01–15) & Camera Angle (01–08) sample images into
+ * IndexedDB so they survive mobile localStorage quota pressure and reloads without
+ * ever being lost or replaced by bundled fallbacks.
+ */
+export async function saveUserSamplesToVault(
+  samples: Record<string, string>,
+): Promise<boolean> {
+  const db = await openVaultDb();
+  if (!db) return false;
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      store.put(samples, SAMPLES_RECORD_KEY);
+      tx.oncomplete = () => {
+        db.close();
+        resolve(true);
+      };
+      tx.onerror = () => {
+        db.close();
+        resolve(false);
+      };
+      tx.onabort = () => {
+        db.close();
+        resolve(false);
+      };
+    } catch {
+      try {
+        db.close();
+      } catch {
+        // ignore
+      }
+      resolve(false);
+    }
+  });
+}
+
+export async function loadUserSamplesFromVault(): Promise<Record<
+  string,
+  string
+> | null> {
+  const db = await openVaultDb();
+  if (!db) return null;
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.get(SAMPLES_RECORD_KEY);
+      req.onsuccess = () => {
+        db.close();
+        const val = req.result;
+        if (val && typeof val === 'object' && !Array.isArray(val)) {
+          resolve(val as Record<string, string>);
+        } else {
+          resolve(null);
+        }
+      };
+      req.onerror = () => {
+        db.close();
+        resolve(null);
+      };
+    } catch {
+      try {
+        db.close();
+      } catch {
+        // ignore
+      }
+      resolve(null);
+    }
+  });
+}
+
+export async function clearUserSamplesVault(): Promise<void> {
+  const db = await openVaultDb();
+  if (!db) return;
+  await new Promise<void>((resolve) => {
+    try {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      tx.objectStore(STORE_NAME).delete(SAMPLES_RECORD_KEY);
+      tx.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      tx.onerror = () => {
+        db.close();
+        resolve();
+      };
+    } catch {
+      try {
+        db.close();
+      } catch {
+        // ignore
+      }
+      resolve();
+    }
+  });
+}

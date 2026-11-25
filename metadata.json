@@ -1,0 +1,8 @@
+{
+  "name": "Remix Remix Remix Remix Remix Ark Lite — Mobile Edition",
+  "description": "Ứng dụng đọc và nhập vai tương tác Ark Lite: hỗ trợ Proxy AI (OpenAI/Gemini), Seedream 5 Pro, chế độ Đồng Nhân tra cứu \u0026 phân tích tác phẩm gốc, P\u0026P Preset và quản lý Save đa slot.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
