@@ -40,6 +40,7 @@ import {
   Settings,
   ShieldCheck,
   SlidersHorizontal,
+  Smartphone,
   Sparkles,
   Square,
   Swords,
@@ -68,6 +69,8 @@ import {
   type PendingImage,
   type PortraitBankConfig,
   type PortraitGenProgress,
+  type ShowbizPhoneApiConfig,
+  type ShowbizPhoneState,
   type StoryImageConfig,
   type StoryImageGenerationProgress,
   type StoryImageItem,
@@ -77,6 +80,12 @@ import {
   type ViewName,
   type WorldInfo,
 } from '../types/ark';
+import {
+  CHAT_IMAGE_MAX_DIMENSION_OPTIONS,
+  CHAT_IMAGE_MAX_INPUT_MB_OPTIONS,
+  CHAT_IMAGE_QUALITY_OPTIONS,
+  formatBytesCompact,
+} from '../utils/chatImageUpload';
 import {
   generateCultivationRankingsWithAi,
   recalculateCultivationRankingsWithAi,
@@ -137,6 +146,8 @@ import {
   loadComposerDraftFromIndexedDb,
   saveComposerDraft,
 } from '../utils/storage';
+import { getShowbizMcProfile } from '../utils/showbizPhone';
+import { ShowbizPhonePanel } from './ShowbizPhonePanel';
 import { CharacterNameBadge } from './CharacterNameBadge';
 import {
   CultivationPanel,
@@ -2011,6 +2022,11 @@ interface ChatViewProps {
   streamingTurnId?: string | null;
   streamingText: string;
   pendingImages: PendingImage[];
+  isPreparingChatImages?: boolean;
+  chatImageMaxInputMb?: number;
+  chatImageMaxDimension?: number;
+  chatImageQuality?: number;
+  chatImageAutoClearAfterReply?: boolean;
   imageCaption: string;
   storyImageConfig: StoryImageConfig;
   memoryConfig: MemoryManagerConfig;
@@ -2120,6 +2136,13 @@ interface ChatViewProps {
   onSelectPendingImage: (img: PendingImage, suggestedCaption?: string) => void;
   onRemovePendingImage: (index: number) => void;
   onClearPendingImages: () => void;
+  onUpdateChatImageConfig?: (patch: {
+    chatImageMaxInputMb?: number;
+    chatImageMaxDimension?: number;
+    chatImageQuality?: number;
+    chatImageAutoClearAfterReply?: boolean;
+  }) => void;
+  onClearTurnAttachedImages?: (turnIndex: number) => void;
   onSendTurn: (userText: string) => void;
   onDownloadImage: (imgSrc: string, filename: string) => void;
   onNotify?: (msg: string, type?: 'info' | 'err') => void;
@@ -2128,6 +2151,10 @@ interface ChatViewProps {
   isQuickBackingUp?: boolean;
   onQuickBackup?: () => void;
   onDismissBackupReminder?: () => void;
+  onUpdateShowbizPhone?: (
+    updater: (prev: ShowbizPhoneState) => ShowbizPhoneState,
+  ) => void;
+  onUpdateShowbizPhoneAiConfig?: (nextConfig: ShowbizPhoneApiConfig) => void;
 }
 
 function TurnAttachedImageItem({
@@ -2138,6 +2165,7 @@ function TurnAttachedImageItem({
   keyHint,
   caption,
   onDownload,
+  onClearAttached,
   onOpenLightbox,
 }: {
   source: string;
@@ -2147,6 +2175,7 @@ function TurnAttachedImageItem({
   keyHint: string;
   caption?: string;
   onDownload: (src: string, filename: string) => void;
+  onClearAttached?: () => void;
   onOpenLightbox: (url: string, label: string) => void;
 }) {
   const { resolvedUrl, isLoading } = useResolvedMediaUrl(source, {
@@ -2201,6 +2230,17 @@ function TurnAttachedImageItem({
             <Download className="h-3.5 w-3.5" />
             <span>Tải ảnh về máy</span>
           </button>
+          {onClearAttached && (
+            <button
+              type="button"
+              onClick={onClearAttached}
+              title="Xóa dữ liệu ảnh tạm của lượt này để giảm RAM/lưu trữ (giữ nguyên chữ & chú thích)"
+              className="inline-flex min-h-[32px] items-center gap-1.5 rounded-lg bg-rose-500/12 px-2.5 text-xs font-semibold text-rose-200 ring-1 ring-inset ring-rose-400/24 transition-colors hover:bg-rose-500/22"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+              <span>Xóa ảnh tạm (nhẹ máy)</span>
+            </button>
+          )}
           {caption && (
             <span className="text-xs text-slate-400">Chú thích: {caption}</span>
           )}
@@ -2263,6 +2303,11 @@ export function ChatView({
   streamingTurnId,
   streamingText,
   pendingImages,
+  isPreparingChatImages = false,
+  chatImageMaxInputMb = 30,
+  chatImageMaxDimension = 1600,
+  chatImageQuality = 0.84,
+  chatImageAutoClearAfterReply = true,
   imageCaption,
   storyImageConfig,
   memoryConfig,
@@ -2333,6 +2378,8 @@ export function ChatView({
   onSelectPendingImage,
   onRemovePendingImage,
   onClearPendingImages,
+  onUpdateChatImageConfig,
+  onClearTurnAttachedImages,
   onSendTurn,
   onDownloadImage,
   onNotify,
@@ -2341,7 +2388,10 @@ export function ChatView({
   isQuickBackingUp = false,
   onQuickBackup,
   onDismissBackupReminder,
+  onUpdateShowbizPhone,
+  onUpdateShowbizPhoneAiConfig,
 }: ChatViewProps) {
+  const [showChatImageOptions, setShowChatImageOptions] = useState(false);
   const draftScopeKey = appState.activeStoryCompanionId || 'main';
   const [newTurnText, setNewTurnText] = useState<string>(() =>
     loadComposerDraft(draftScopeKey),
@@ -2440,6 +2490,7 @@ export function ChatView({
     | 'cultivation'
     | 'image'
     | 'portraits'
+    | 'showbiz_phone'
     | 'stats';
 
   const [activeUtility, setActiveUtility] = useState<UtilityPanelId>('none');
@@ -3253,7 +3304,52 @@ export function ChatView({
   const aiArticleRef = useRef<HTMLElement | null>(null);
   const draftPreviewRef = useRef<HTMLDivElement | null>(null);
   const autoFollowRef = useRef<boolean>(true);
+  const isUserTouchingRef = useRef<boolean>(false);
+  const touchStartYRef = useRef<number | null>(null);
+  const touchMovedUpwardRef = useRef<boolean>(false);
   const lastScrollYRef = useRef<number>(0);
+  const ignoreScrollUntilRef = useRef<number>(0);
+  const [showScrollToBottomBtn, setShowScrollToBottomBtn] = useState(false);
+
+  const STREAM_NEAR_BOTTOM_PX = 100;
+  const STREAM_BOTTOM_COMFORT_OFFSET_PX = 84;
+
+  const getDistanceToStreamBottom = useCallback((): number => {
+    if (typeof window === 'undefined') return 0;
+    const curY = getDocumentScrollY();
+    const docDistFromBottom = Math.max(0, getMaxDocumentScrollY() - curY);
+    const el = aiArticleRef.current;
+    if (!el) return docDistFromBottom;
+    const rect = el.getBoundingClientRect();
+    const articleDistFromViewport = Math.max(
+      0,
+      rect.bottom - (window.innerHeight - STREAM_BOTTOM_COMFORT_OFFSET_PX),
+    );
+    return Math.min(docDistFromBottom, articleDistFromViewport);
+  }, []);
+
+  const handleJumpToStreamBottom = useCallback(() => {
+    if (typeof window === 'undefined') return;
+    const el = aiArticleRef.current;
+    const maxDocY = getMaxDocumentScrollY();
+    let targetY = maxDocY;
+    if (el) {
+      const rect = el.getBoundingClientRect();
+      const desiredY =
+        getDocumentScrollY() +
+        (rect.bottom - (window.innerHeight - STREAM_BOTTOM_COMFORT_OFFSET_PX));
+      targetY = Math.max(0, Math.min(maxDocY, Math.round(desiredY)));
+    }
+    autoFollowRef.current = true;
+    touchMovedUpwardRef.current = false;
+    setShowScrollToBottomBtn(false);
+    lastScrollYRef.current = targetY;
+    ignoreScrollUntilRef.current = performance.now() + 450;
+    window.scrollTo({
+      top: targetY,
+      behavior: 'smooth',
+    });
+  }, []);
 
   // Reset all per-page transient UI states whenever active page or turn identity changes
   // so editing drafts, modals, or prompt previews can NEVER bleed across pages after switch/delete.
@@ -3266,6 +3362,7 @@ export function ChatView({
     setDraftOpenOverride(null);
     setAiSuggestions([]);
     setAiSuggestionError(null);
+    setShowScrollToBottomBtn(false);
     prevHasMainStoryRef.current = false;
   }, [safePage, currentTurnId, streamingTurnIndex, streamingTurnId]);
 
@@ -3277,50 +3374,168 @@ export function ChatView({
     prevHasMainStoryRef.current = parsedAi.hasMainStory;
   }, [parsedAi.hasMainStory, showRawTags]);
 
-  // Passive scroll observer during streaming so auto-follow never fights manual reading
+  // User-first scroll & touch observer during streaming:
+  // - Immediately pauses auto-follow the moment the user swipes/wheels/scrolls upward (never fights mobile touch)
+  // - Only resumes auto-follow when the user scrolls back within <= 100px of the bottom
   useEffect(() => {
     if (!isStreamingCurrentPage || isUtilityScreenOpen) {
       autoFollowRef.current = true;
+      isUserTouchingRef.current = false;
+      touchStartYRef.current = null;
+      touchMovedUpwardRef.current = false;
+      setShowScrollToBottomBtn(false);
       return;
     }
-    autoFollowRef.current = true;
-    lastScrollYRef.current = window.scrollY;
-    const handleScroll = () => {
-      const el = aiArticleRef.current;
-      if (!el) return;
-      const curY = window.scrollY;
-      const rect = el.getBoundingClientRect();
-      const distancePastViewport = rect.bottom - window.innerHeight;
-      if (curY < lastScrollYRef.current - 12 && distancePastViewport > 60) {
-        autoFollowRef.current = false;
-      } else if (distancePastViewport <= 120) {
-        autoFollowRef.current = true;
-      }
-      lastScrollYRef.current = curY;
-    };
-    window.addEventListener('scroll', handleScroll, { passive: true });
-    return () => window.removeEventListener('scroll', handleScroll);
-  }, [isStreamingCurrentPage, isUtilityScreenOpen]);
 
-  // Smooth rAF-driven scroll-follow while streaming
+    const initialNearBottom =
+      getDistanceToStreamBottom() <= STREAM_NEAR_BOTTOM_PX;
+    autoFollowRef.current = initialNearBottom;
+    setShowScrollToBottomBtn(!initialNearBottom);
+    lastScrollYRef.current = getDocumentScrollY();
+
+    const pauseAutoFollow = () => {
+      if (autoFollowRef.current) {
+        autoFollowRef.current = false;
+      }
+      if (getDistanceToStreamBottom() > 24) {
+        setShowScrollToBottomBtn(true);
+      }
+    };
+
+    const handleTouchStart = (ev: TouchEvent) => {
+      isUserTouchingRef.current = true;
+      touchMovedUpwardRef.current = false;
+      touchStartYRef.current = ev.touches[0]?.clientY ?? null;
+    };
+
+    const handleTouchMove = (ev: TouchEvent) => {
+      const startY = touchStartYRef.current;
+      const curTouchY = ev.touches[0]?.clientY;
+      if (startY !== null && typeof curTouchY === 'number') {
+        // Finger moving downward on screen = scrolling content UP to read earlier text
+        if (curTouchY - startY > 6) {
+          touchMovedUpwardRef.current = true;
+          pauseAutoFollow();
+        }
+      }
+    };
+
+    const handleTouchEnd = () => {
+      const wasUpwardGesture = touchMovedUpwardRef.current;
+      isUserTouchingRef.current = false;
+      touchStartYRef.current = null;
+      touchMovedUpwardRef.current = false;
+      const dist = getDistanceToStreamBottom();
+      if (!wasUpwardGesture && !autoFollowRef.current && dist <= STREAM_NEAR_BOTTOM_PX) {
+        autoFollowRef.current = true;
+        setShowScrollToBottomBtn(false);
+      } else if (!autoFollowRef.current && dist > STREAM_NEAR_BOTTOM_PX) {
+        setShowScrollToBottomBtn(true);
+      }
+    };
+
+    const handleWheel = (ev: WheelEvent) => {
+      if (ev.deltaY < 0) {
+        pauseAutoFollow();
+      }
+    };
+
+    const handleScroll = () => {
+      const curY = getDocumentScrollY();
+      const prevY = lastScrollYRef.current;
+      lastScrollYRef.current = curY;
+
+      // Ignore scroll events triggered by our own programmatic auto-scroll step
+      if (performance.now() < ignoreScrollUntilRef.current) {
+        return;
+      }
+
+      const dist = getDistanceToStreamBottom();
+
+      // Any upward manual scroll immediately pauses auto-follow
+      if (curY < prevY - 4) {
+        autoFollowRef.current = false;
+        setShowScrollToBottomBtn(dist > 24);
+        return;
+      }
+
+      // If user scrolled down or dragged scrollbar back near the bottom (<= 100px), re-enable auto-follow
+      if (!autoFollowRef.current) {
+        if (dist <= STREAM_NEAR_BOTTOM_PX && !isUserTouchingRef.current) {
+          autoFollowRef.current = true;
+          setShowScrollToBottomBtn(false);
+        } else {
+          setShowScrollToBottomBtn(dist > STREAM_NEAR_BOTTOM_PX);
+        }
+      } else if (dist > STREAM_NEAR_BOTTOM_PX + 40) {
+        // User left the bottom (e.g. scrollbar jump) without upward delta
+        autoFollowRef.current = false;
+        setShowScrollToBottomBtn(true);
+      }
+    };
+
+    window.addEventListener('scroll', handleScroll, { passive: true });
+    window.addEventListener('touchstart', handleTouchStart, { passive: true });
+    window.addEventListener('touchmove', handleTouchMove, { passive: true });
+    window.addEventListener('touchend', handleTouchEnd, { passive: true });
+    window.addEventListener('touchcancel', handleTouchEnd, { passive: true });
+    window.addEventListener('wheel', handleWheel, { passive: true });
+
+    return () => {
+      window.removeEventListener('scroll', handleScroll);
+      window.removeEventListener('touchstart', handleTouchStart);
+      window.removeEventListener('touchmove', handleTouchMove);
+      window.removeEventListener('touchend', handleTouchEnd);
+      window.removeEventListener('touchcancel', handleTouchEnd);
+      window.removeEventListener('wheel', handleWheel);
+    };
+  }, [isStreamingCurrentPage, isUtilityScreenOpen, getDistanceToStreamBottom]);
+
+  // Smooth rAF-driven scroll-follow while streaming (strictly only when near bottom & user is not touching/scrolled up)
   useEffect(() => {
     if (!isStreamingCurrentPage || isUtilityScreenOpen) return;
     const rafId = requestAnimationFrame(() => {
       if (parsedAi.inDraftPhase && draftPreviewRef.current) {
-        draftPreviewRef.current.scrollTop =
-          draftPreviewRef.current.scrollHeight;
+        const draftEl = draftPreviewRef.current;
+        const draftDist =
+          draftEl.scrollHeight - draftEl.scrollTop - draftEl.clientHeight;
+        if (draftDist <= STREAM_NEAR_BOTTOM_PX) {
+          draftEl.scrollTop = draftEl.scrollHeight;
+        }
         return;
       }
-      if (autoFollowRef.current && aiArticleRef.current) {
+
+      if (isUserTouchingRef.current) {
+        return;
+      }
+
+      if (!autoFollowRef.current) {
+        const dist = getDistanceToStreamBottom();
+        if (dist > STREAM_NEAR_BOTTOM_PX) {
+          setShowScrollToBottomBtn(true);
+        }
+        return;
+      }
+
+      if (aiArticleRef.current) {
         const rect = aiArticleRef.current.getBoundingClientRect();
-        const bottomGap = rect.bottom - (window.innerHeight - 96);
-        if (bottomGap > 6 && bottomGap < 420) {
+        const bottomGap =
+          rect.bottom - (window.innerHeight - STREAM_BOTTOM_COMFORT_OFFSET_PX);
+        // If viewport has drifted far above the bottom, pause auto-follow instead of yanking the user down
+        if (bottomGap > STREAM_NEAR_BOTTOM_PX + 80) {
+          autoFollowRef.current = false;
+          setShowScrollToBottomBtn(true);
+          return;
+        }
+        if (bottomGap > 4) {
           const gentleStep = Math.min(
             bottomGap,
-            Math.max(2, Math.ceil(bottomGap * 0.28)),
+            Math.max(2, Math.ceil(bottomGap * 0.3)),
           );
-          const nextTop = window.scrollY + gentleStep;
+          const maxDocY = getMaxDocumentScrollY();
+          const nextTop = Math.min(maxDocY, getDocumentScrollY() + gentleStep);
           lastScrollYRef.current = nextTop;
+          ignoreScrollUntilRef.current = performance.now() + 120;
           window.scrollTo({
             top: nextTop,
             behavior: 'auto',
@@ -3334,6 +3549,7 @@ export function ChatView({
     isUtilityScreenOpen,
     streamingText,
     parsedAi.inDraftPhase,
+    getDistanceToStreamBottom,
   ]);
 
   const isDraftExpanded =
@@ -3682,20 +3898,28 @@ export function ChatView({
                   icon: Search,
                   accentClass: 'text-sky-300',
                 }
-              : activeUtility === 'stats'
+              : activeUtility === 'showbiz_phone'
                 ? {
-                    title: 'Thống kê lượt truyện',
-                    subtitle: `${storyStats.totalWords.toLocaleString('vi-VN')} từ · ${storyStats.turnCount} lượt`,
-                    icon: BarChart3,
-                    accentClass: 'text-indigo-300',
+                    title: 'Điện thoại Showbiz',
+                    subtitle: `${appState.showbizPhone?.contacts?.length || 0} liên hệ · ${appState.showbizPhone?.groups?.length || 0} nhóm · ${appState.showbizPhone?.posts?.length || 0} bài MXH`,
+                    icon: Smartphone,
+                    accentClass: 'text-amber-300',
                   }
-                : null;
+                : activeUtility === 'stats'
+                  ? {
+                      title: 'Thống kê lượt truyện',
+                      subtitle: `${storyStats.totalWords.toLocaleString('vi-VN')} từ · ${storyStats.turnCount} lượt`,
+                      icon: BarChart3,
+                      accentClass: 'text-indigo-300',
+                    }
+                  : null;
 
   const utilityQuickTabs: Array<{
     id: Exclude<UtilityPanelId, 'none'>;
     label: string;
     icon: typeof Search;
   }> = [
+    { id: 'showbiz_phone', label: 'Điện thoại', icon: Smartphone },
     { id: 'portraits', label: 'Ảnh NV/NPC', icon: Users },
     { id: 'memory', label: 'Ký ức', icon: Brain },
     ...(cultivationProfile
@@ -3789,6 +4013,7 @@ export function ChatView({
               portraitBank={portraitBank}
               appConfig={appState.config}
               activeCompanionName={activeCompanionName}
+              activeMainName={getShowbizMcProfile(appState).name}
               storyClock={memoryConfig.storyClock}
               hasSeedreamConfigured={hasSeedreamConfigured}
               generatingPortraitIds={generatingPortraitIds}
@@ -3826,6 +4051,31 @@ export function ChatView({
                   portraitName,
                 })
               }
+            />
+          )}
+
+          {/* Dedicated Sub-Screen Content: Showbiz Phone (DM / Group / MXH) */}
+          {activeUtility === 'showbiz_phone' && (
+            <ShowbizPhonePanel
+              state={appState}
+              onUpdatePhone={(updater) => onUpdateShowbizPhone?.(updater)}
+              onUpdatePhoneAiConfig={(nextCfg) =>
+                onUpdateShowbizPhoneAiConfig?.(nextCfg)
+              }
+              onBridgeToStory={(storyPrompt) => {
+                const nextVal = newTurnText.trim()
+                  ? `${newTurnText.trim()}\n\n${storyPrompt}`
+                  : storyPrompt;
+                setNewTurnText(nextVal);
+                newTurnTextRef.current = nextVal;
+                closeUtilityScreen();
+                onNotify?.(
+                  'Đã đưa bài đăng MXH sang khung nhập truyện. Bạn có thể chỉnh nhẹ hoặc bấm Gửi ngay.',
+                  'info',
+                );
+                requestAnimationFrame(() => newTurnInputRef.current?.focus());
+              }}
+              onShowBanner={onNotify}
             />
           )}
 
@@ -5026,6 +5276,19 @@ export function ChatView({
                   </span>
                 </button>
 
+                {/* Quick 1-tap Showbiz Phone Button */}
+                {!zenMode && (
+                  <button
+                    type="button"
+                    onClick={() => openUtilityScreen('showbiz_phone')}
+                    title="Mở Điện thoại Showbiz (DM, Chat nhóm, MXH chạy AI riêng)"
+                    className="inline-flex h-10 sm:h-9 items-center justify-center gap-1.5 rounded-xl bg-amber-500/14 px-2.5 sm:px-3 text-xs font-semibold text-amber-100 ring-1 ring-inset ring-amber-400/30 transition-all hover:bg-amber-500/22 active:scale-[0.98] whitespace-nowrap shrink-0"
+                  >
+                    <Smartphone className="h-3.5 w-3.5 shrink-0 text-amber-300" />
+                    <span className="hidden sm:inline">Điện thoại</span>
+                  </button>
+                )}
+
                 {/* Tiện ích Dropdown / Popover (opens each tool on its own dedicated screen) */}
                 {!zenMode && (
                   <div ref={utilityMenuRef} className="relative">
@@ -5056,6 +5319,29 @@ export function ChatView({
                         className="absolute right-0 top-full z-40 mt-2 w-[min(324px,calc(100vw-2rem))] rounded-2xl bg-[#182438]/96 p-2 ring-1 ring-white/[0.10] shadow-[0_24px_56px_-12px_rgba(2,6,23,0.82)] backdrop-blur-xl"
                       >
                         <div className="space-y-1">
+                          {/* 0. Điện thoại Showbiz */}
+                          <button
+                            type="button"
+                            role="menuitem"
+                            onClick={() => openUtilityScreen('showbiz_phone')}
+                            className="flex min-h-[44px] w-full items-center justify-between gap-2.5 rounded-xl px-3 py-2 text-left text-slate-200 transition-colors hover:bg-white/[0.06]"
+                          >
+                            <div className="flex min-w-0 items-center gap-2.5">
+                              <Smartphone className="h-4 w-4 shrink-0 text-amber-300" />
+                              <div className="min-w-0">
+                                <div className="text-xs font-semibold">
+                                  Điện thoại Showbiz
+                                </div>
+                                <div className="truncate text-[11px] text-slate-400 tabular-nums">
+                                  DM · Chat nhóm · MXH ({appState.showbizPhone?.contacts?.length || 0} liên hệ)
+                                </div>
+                              </div>
+                            </div>
+                            <span className="shrink-0 text-[11px] font-medium text-amber-300">
+                              Mở →
+                            </span>
+                          </button>
+
                           {/* 1. Tìm kiếm */}
                           <button
                             type="button"
@@ -5831,7 +6117,7 @@ export function ChatView({
               )}
             </div>
 
-            {currentTurnAttachedImages.length > 0 && (
+            {currentTurnAttachedImages.length > 0 ? (
               <div className="mb-3.5 space-y-2">
                 {currentTurnAttachedImages.length === 1 ? (
                   <TurnAttachedImageItem
@@ -5842,6 +6128,11 @@ export function ChatView({
                     keyHint={currentAttachKey}
                     caption={currentTurn.imageCaption}
                     onDownload={onDownloadImage}
+                    onClearAttached={
+                      onClearTurnAttachedImages && !isGenerating
+                        ? () => onClearTurnAttachedImages(safePage)
+                        : undefined
+                    }
                     onOpenLightbox={(url, label) =>
                       setLightboxImage({
                         src: url,
@@ -5851,11 +6142,20 @@ export function ChatView({
                   />
                 ) : (
                   <>
-                    <div className="flex items-center justify-between gap-2 text-[11px] font-medium text-slate-400">
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-medium text-slate-400">
                       <span>
-                        Đã đính kèm {currentTurnAttachedImages.length} ảnh
+                        Đã đính kèm {currentTurnAttachedImages.length} ảnh · Bấm ảnh để phóng to
                       </span>
-                      <span className="text-slate-500">Bấm ảnh để phóng to</span>
+                      {onClearTurnAttachedImages && !isGenerating && (
+                        <button
+                          type="button"
+                          onClick={() => onClearTurnAttachedImages(safePage)}
+                          className="inline-flex min-h-[28px] items-center gap-1 rounded-lg bg-rose-500/12 px-2 text-[11px] font-semibold text-rose-200 ring-1 ring-inset ring-rose-400/24 transition-colors hover:bg-rose-500/22"
+                        >
+                          <Trash2 className="h-3 w-3" />
+                          <span>Xóa {currentTurnAttachedImages.length} ảnh tạm</span>
+                        </button>
+                      )}
                     </div>
                     <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                       {currentTurnAttachedImages.map((src, imgIdx) => (
@@ -5889,7 +6189,19 @@ export function ChatView({
                   </>
                 )}
               </div>
-            )}
+            ) : (currentTurn.attachedImageClearedCount || 0) > 0 ? (
+              <div className="mb-3 flex flex-wrap items-center gap-2 rounded-xl bg-white/[0.03] px-3 py-2 text-[11.5px] text-slate-400 ring-1 ring-inset ring-white/[0.07]">
+                <ImageOff className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+                <span>
+                  Đã giải phóng {currentTurn.attachedImageClearedCount} ảnh đính kèm sau khi phản hồi (nhẹ máy)
+                </span>
+                {currentTurn.imageCaption && (
+                  <span className="text-slate-300">
+                    · Chú thích: {currentTurn.imageCaption}
+                  </span>
+                )}
+              </div>
+            ) : null}
 
             {editingUserIdx === safePage ? (
               <textarea
@@ -6549,15 +6861,35 @@ export function ChatView({
                   {pendingImages.length === 1 && (
                     <span className="shrink-0 text-[11px] font-medium tabular-nums text-sky-300/80">
                       1/{MAX_PENDING_CHAT_IMAGES}
+                      {pendingImages[0].compressedBytes
+                        ? ` · ${formatBytesCompact(pendingImages[0].compressedBytes)}`
+                        : ''}
                     </span>
                   )}
                 </div>
                 <div className="flex shrink-0 items-center gap-1.5">
+                  {onUpdateChatImageConfig && (
+                    <button
+                      type="button"
+                      onClick={() => setShowChatImageOptions((v) => !v)}
+                      aria-expanded={showChatImageOptions}
+                      title="Tùy chọn giới hạn & nén/resize ảnh gửi"
+                      className={`inline-flex min-h-[28px] items-center gap-1 rounded-lg px-2 text-[11px] font-semibold ring-1 ring-inset transition-colors whitespace-nowrap ${
+                        showChatImageOptions
+                          ? 'bg-sky-500/24 text-sky-100 ring-sky-400/45'
+                          : 'bg-white/[0.06] text-slate-200 ring-white/[0.12] hover:bg-white/[0.12]'
+                      }`}
+                    >
+                      <SlidersHorizontal className="h-3 w-3" />
+                      <span className="hidden xs:inline">Nén</span>
+                    </button>
+                  )}
                   {pendingImages.length < MAX_PENDING_CHAT_IMAGES && (
                     <button
                       type="button"
+                      disabled={isPreparingChatImages}
                       onClick={onPickImage}
-                      className="inline-flex min-h-[28px] items-center gap-1 rounded-lg bg-sky-500/14 px-2 text-[11px] font-semibold text-sky-200 ring-1 ring-inset ring-sky-400/28 transition-colors hover:bg-sky-500/24 whitespace-nowrap"
+                      className="inline-flex min-h-[28px] items-center gap-1 rounded-lg bg-sky-500/14 px-2 text-[11px] font-semibold text-sky-200 ring-1 ring-inset ring-sky-400/28 transition-colors hover:bg-sky-500/24 disabled:opacity-50 whitespace-nowrap"
                     >
                       <ImagePlus className="h-3 w-3" />
                       <span>Thêm ảnh</span>
@@ -6579,7 +6911,7 @@ export function ChatView({
                 {pendingImages.map((img, idx) => (
                   <div
                     key={img.id || `${img.name}_${idx}`}
-                    className="group relative w-[72px] shrink-0"
+                    className="group relative w-[76px] shrink-0"
                   >
                     <button
                       type="button"
@@ -6589,8 +6921,12 @@ export function ChatView({
                           label: img.name || `Ảnh chờ gửi #${idx + 1}`,
                         })
                       }
-                      title={img.name}
-                      className="block h-16 w-[72px] overflow-hidden rounded-lg bg-[#0b1322] ring-1 ring-white/[0.14] focus:outline-none focus:ring-2 focus:ring-sky-400/50"
+                      title={
+                        img.compressedBytes
+                          ? `${img.name} (${formatBytesCompact(img.compressedBytes)}${img.width && img.height ? ` · ${img.width}×${img.height}` : ''})`
+                          : img.name
+                      }
+                      className="block h-16 w-[76px] overflow-hidden rounded-lg bg-[#0b1322] ring-1 ring-white/[0.14] focus:outline-none focus:ring-2 focus:ring-sky-400/50"
                     >
                       <img
                         src={img.dataUrl}
@@ -6599,9 +6935,13 @@ export function ChatView({
                         className="h-full w-full object-cover transition-transform duration-150 group-hover:scale-105"
                       />
                     </button>
-                    {pendingImages.length > 1 && (
-                      <span className="pointer-events-none absolute bottom-1 left-1 rounded bg-[#090f1b]/82 px-1 py-0.5 text-[9px] font-semibold tabular-nums text-slate-100 ring-1 ring-white/15">
-                        #{idx + 1}
+                    {(pendingImages.length > 1 || img.compressedBytes) && (
+                      <span className="pointer-events-none absolute right-1 bottom-1 left-1 truncate rounded bg-[#090f1b]/82 px-1 py-0.5 text-center text-[9px] font-semibold tabular-nums text-slate-100 ring-1 ring-white/15">
+                        {pendingImages.length > 1 ? `#${idx + 1}` : ''}
+                        {pendingImages.length > 1 && img.compressedBytes ? ' · ' : ''}
+                        {img.compressedBytes
+                          ? formatBytesCompact(img.compressedBytes)
+                          : ''}
                       </span>
                     )}
                     <button
@@ -6616,6 +6956,99 @@ export function ChatView({
                   </div>
                 ))}
               </div>
+
+              {onUpdateChatImageConfig && (
+                <div className="space-y-2 rounded-lg bg-[#0e1729]/85 px-2.5 py-2 ring-1 ring-inset ring-white/[0.07]">
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="flex min-w-0 cursor-pointer items-center gap-2 text-[11px] font-medium text-slate-200">
+                      <input
+                        type="checkbox"
+                        checked={chatImageAutoClearAfterReply}
+                        onChange={(e) =>
+                          onUpdateChatImageConfig({
+                            chatImageAutoClearAfterReply: e.target.checked,
+                          })
+                        }
+                        className="h-3.5 w-3.5 rounded border-slate-500 bg-[#0b1322] accent-sky-400"
+                      />
+                      <span className="truncate">
+                        Tự xóa ảnh sau khi nhận phản hồi (nhẹ máy)
+                      </span>
+                    </label>
+                    <span className="shrink-0 text-[10px] font-medium tabular-nums text-slate-400">
+                      ≤{chatImageMaxInputMb}MB ·{' '}
+                      {chatImageMaxDimension > 0
+                        ? `${chatImageMaxDimension}px`
+                        : 'Gốc'}
+                    </span>
+                  </div>
+
+                  {showChatImageOptions && (
+                    <div className="grid grid-cols-1 gap-2 border-t border-white/[0.07] pt-2 sm:grid-cols-3">
+                      <label className="block">
+                        <span className="mb-1 block text-[10px] font-semibold text-slate-400">
+                          Giới hạn đầu vào
+                        </span>
+                        <select
+                          value={chatImageMaxInputMb}
+                          onChange={(e) =>
+                            onUpdateChatImageConfig({
+                              chatImageMaxInputMb: Number(e.target.value),
+                            })
+                          }
+                          className="w-full rounded-lg border border-white/[0.10] bg-[#0b1322] px-2 py-1 text-[11px] text-slate-100 focus:border-sky-400/70 focus:outline-none"
+                        >
+                          {CHAT_IMAGE_MAX_INPUT_MB_OPTIONS.map((mb) => (
+                            <option key={mb} value={mb}>
+                              Tối đa {mb} MB
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="block">
+                        <span className="mb-1 block text-[10px] font-semibold text-slate-400">
+                          Resize tự động
+                        </span>
+                        <select
+                          value={chatImageMaxDimension}
+                          onChange={(e) =>
+                            onUpdateChatImageConfig({
+                              chatImageMaxDimension: Number(e.target.value),
+                            })
+                          }
+                          className="w-full rounded-lg border border-white/[0.10] bg-[#0b1322] px-2 py-1 text-[11px] text-slate-100 focus:border-sky-400/70 focus:outline-none"
+                        >
+                          {CHAT_IMAGE_MAX_DIMENSION_OPTIONS.map((opt) => (
+                            <option key={opt.value} value={opt.value}>
+                              {opt.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="block">
+                        <span className="mb-1 block text-[10px] font-semibold text-slate-400">
+                          Chất lượng nén
+                        </span>
+                        <select
+                          value={chatImageQuality}
+                          onChange={(e) =>
+                            onUpdateChatImageConfig({
+                              chatImageQuality: Number(e.target.value),
+                            })
+                          }
+                          className="w-full rounded-lg border border-white/[0.10] bg-[#0b1322] px-2 py-1 text-[11px] text-slate-100 focus:border-sky-400/70 focus:outline-none"
+                        >
+                          {CHAT_IMAGE_QUALITY_OPTIONS.map((opt) => (
+                            <option key={opt.value} value={opt.value}>
+                              {opt.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                  )}
+                </div>
+              )}
 
               <input
                 id="imageCaptionInput"
@@ -6638,21 +7071,30 @@ export function ChatView({
             <div className="flex min-w-0 items-center gap-1.5 sm:gap-2">
               <button
                 type="button"
+                disabled={isPreparingChatImages}
                 onClick={onPickImage}
-                className="inline-flex h-11 items-center justify-center gap-1.5 rounded-xl bg-white/[0.055] px-2.5 text-xs font-semibold text-slate-200 ring-1 ring-inset ring-white/[0.10] transition-all hover:bg-white/[0.10] hover:text-white active:scale-[0.98] whitespace-nowrap sm:px-3.5"
+                className="inline-flex h-11 items-center justify-center gap-1.5 rounded-xl bg-white/[0.055] px-2.5 text-xs font-semibold text-slate-200 ring-1 ring-inset ring-white/[0.10] transition-all hover:bg-white/[0.10] hover:text-white active:scale-[0.98] disabled:opacity-60 whitespace-nowrap sm:px-3.5"
               >
-                <ImagePlus className="h-4 w-4 shrink-0 text-sky-300" />
+                {isPreparingChatImages ? (
+                  <Loader2 className="h-4 w-4 shrink-0 animate-spin text-sky-300" />
+                ) : (
+                  <ImagePlus className="h-4 w-4 shrink-0 text-sky-300" />
+                )}
                 <span>
-                  Gửi ảnh
-                  {pendingImages.length > 0
-                    ? ` (${pendingImages.length}/${MAX_PENDING_CHAT_IMAGES})`
-                    : ''}
+                  {isPreparingChatImages
+                    ? 'Đang nén ảnh...'
+                    : `Gửi ảnh${
+                        pendingImages.length > 0
+                          ? ` (${pendingImages.length}/${MAX_PENDING_CHAT_IMAGES})`
+                          : ''
+                      }`}
                 </span>
               </button>
               <button
                 type="button"
+                disabled={isPreparingChatImages}
                 onClick={() => setImagePickerTarget({ mode: 'composer' })}
-                className="inline-flex h-11 items-center justify-center gap-1.5 rounded-xl bg-white/[0.055] px-2.5 text-xs font-semibold text-slate-200 ring-1 ring-inset ring-white/[0.10] transition-all hover:bg-white/[0.10] hover:text-white active:scale-[0.98] whitespace-nowrap sm:px-3.5"
+                className="inline-flex h-11 items-center justify-center gap-1.5 rounded-xl bg-white/[0.055] px-2.5 text-xs font-semibold text-slate-200 ring-1 ring-inset ring-white/[0.10] transition-all hover:bg-white/[0.10] hover:text-white active:scale-[0.98] disabled:opacity-60 whitespace-nowrap sm:px-3.5"
               >
                 <ImageIcon className="h-4 w-4 shrink-0 text-indigo-300" />
                 <span>Chọn ảnh</span>
@@ -6661,7 +7103,7 @@ export function ChatView({
 
             <button
               type="button"
-              disabled={isGenerating}
+              disabled={isGenerating || isPreparingChatImages}
               onClick={handleSubmit}
               className="inline-flex h-11 min-w-[84px] shrink-0 items-center justify-center gap-1.5 rounded-xl bg-gradient-to-b from-sky-400 to-blue-600 px-4 text-[13px] font-semibold text-white ring-1 ring-inset ring-white/20 shadow-[0_8px_20px_-6px_rgba(14,165,233,0.55)] transition-all hover:from-sky-300 hover:to-blue-500 active:scale-[0.98] disabled:opacity-60 whitespace-nowrap sm:min-w-[108px] sm:px-5"
             >
@@ -6675,6 +7117,24 @@ export function ChatView({
           </div>
         </div>
       </div>
+      )}
+
+      {isStreamingCurrentPage && !isUtilityScreenOpen && showScrollToBottomBtn && (
+        <div
+          className={`fixed right-4 z-[85] ${
+            hideBottomNav ? 'bottom-5' : 'bottom-20 sm:bottom-24'
+          }`}
+        >
+          <button
+            type="button"
+            onClick={handleJumpToStreamBottom}
+            aria-label="Cuộn xuống cuối để tiếp tục theo dõi đoạn đang stream"
+            className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl bg-[#101a2d]/92 px-3 py-2 text-xs font-semibold text-sky-200 ring-1 ring-inset ring-sky-400/38 shadow-[0_12px_28px_-8px_rgba(2,8,23,0.85)] backdrop-blur-md transition-all hover:bg-[#162540] hover:text-white active:scale-[0.97]"
+          >
+            <ChevronDown className="h-4 w-4 shrink-0 text-sky-300" />
+            <span>Xuống cuối</span>
+          </button>
+        </div>
       )}
         </>
       )}

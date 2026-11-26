@@ -19,6 +19,13 @@ import type {
   RelationshipLayerKind,
   RelationshipTone,
   SafetySetting,
+  ShowbizPhoneApiConfig,
+  ShowbizPhoneComment,
+  ShowbizPhoneContact,
+  ShowbizPhoneGroup,
+  ShowbizPhoneMessage,
+  ShowbizPhonePost,
+  ShowbizPhoneState,
   StoryClockState,
   StoryImageConfig,
   TawaPreset,
@@ -30,7 +37,10 @@ import {
   cleanAndDeduplicateCharacterStates,
   cleanJunkCompanionNpcs,
   cleanJunkPortraitsFromBank,
+  isInvalidNpcPortrait,
   isPortraitAutoScannedUnconfirmed,
+  isShortCodeOrBracketedJunkName,
+  isShortenedTailOfFullNameKey,
   matchPortraitByName,
   normalizeCharacterKey,
   resolveLocalVividNpcProfile,
@@ -44,6 +54,14 @@ import {
   compactLongTermMemory,
   sanitizeMemoryEntry,
 } from './longTermMemory';
+import {
+  clampChatImageMaxDimension,
+  clampChatImageMaxInputMb,
+  clampChatImageQuality,
+  DEFAULT_CHAT_IMAGE_MAX_DIMENSION,
+  DEFAULT_CHAT_IMAGE_MAX_INPUT_MB,
+  DEFAULT_CHAT_IMAGE_QUALITY,
+} from './chatImageUpload';
 import {
   extractPersistableSampleImages,
   normalizeStoryImageConfig,
@@ -706,12 +724,37 @@ export function syncPortraitBankWithCompanion(
     }
   }
 
-  // 2. Sync NPCs from active companion profile
-  for (let i = 0; i < (comp.npcs || []).length; i++) {
-    const npc = comp.npcs[i];
+  // 2. Sync NPCs from active companion profile (strictly filter junk, abbreviations, locations & MC-tail duplicates)
+  const mcKey = normalizeCharacterKey(mcName);
+  const cleanedCompNpcs = cleanJunkCompanionNpcs(comp.npcs || [], { mcName });
+  for (let i = 0; i < cleanedCompNpcs.length; i++) {
+    const npc = cleanedCompNpcs[i];
     const name = (npc.name || '').trim();
-    if (!name) continue;
+    if (!name || isShortCodeOrBracketedJunkName(name)) continue;
+    if (
+      isInvalidNpcPortrait({
+        name,
+        role: npc.role || '',
+        appearance: npc.appearance || npc.desc || '',
+        personality: npc.personality,
+        isMc: false,
+      })
+    ) {
+      continue;
+    }
     const key = normalizeCharacterKey(name);
+    if (!key) continue;
+    // Never add a separate NPC entry if it is the MC or a shortened tail of MC's name (e.g. "Vô Trần" when MC is "Lục Vô Trần")
+    if (
+      mcKey &&
+      (key === mcKey || isShortenedTailOfFullNameKey(key, mcKey))
+    ) {
+      continue;
+    }
+    const matchedAny = matchPortraitByName(name, list);
+    if (matchedAny?.isMc) {
+      continue;
+    }
     const resolvedNpc = resolveLocalVividNpcProfile({
       name,
       isMc: false,
@@ -731,10 +774,7 @@ export function syncPortraitBankWithCompanion(
     const bestNpcSignature = npc.signature?.trim() || resolvedNpc.signature;
     const bestNpcLocation = npc.currentLocation?.trim() || '';
     const bestNpcSecret = npc.privateSecret?.trim() || '';
-    const matchedByAlias = matchPortraitByName(
-      name,
-      list.filter((p) => !p.isMc),
-    );
+    const matchedByAlias = matchedAny && !matchedAny.isMc ? matchedAny : undefined;
     const existingIdx = list.findIndex(
       (p) =>
         (npc.id && p.npcId === npc.id) ||
@@ -2286,6 +2326,7 @@ export function createInitialState(): ArkState {
     },
     memory: createDefaultMemoryConfig(),
     portraitBank: createDefaultPortraitBank(),
+    showbizPhone: createDefaultShowbizPhoneState(),
     player: { name: '', pronoun: '' },
     world: { name: 'Thế giới hiện đại' },
     config: {
@@ -2293,6 +2334,7 @@ export function createInitialState(): ArkState {
       proxyKey: '',
       model: '',
       taskModels: {},
+      showbizPhoneConfig: {},
       apiProtocol: 'openai',
       useServerProxy: true,
       imageProvider: 'seedream',
@@ -2330,6 +2372,10 @@ export function createInitialState(): ArkState {
       latentUseServerProxy: false,
       hapticFeedbackEnabled: true,
       autoStoryBeatsEnabled: true,
+      chatImageMaxInputMb: DEFAULT_CHAT_IMAGE_MAX_INPUT_MB,
+      chatImageMaxDimension: DEFAULT_CHAT_IMAGE_MAX_DIMENSION,
+      chatImageQuality: DEFAULT_CHAT_IMAGE_QUALITY,
+      chatImageAutoClearAfterReply: true,
       safetySettings: DEFAULT_SAFETY.map((s) => ({ ...s })),
     },
     tawaPreset: {
@@ -2362,8 +2408,10 @@ export function createInitialState(): ArkState {
     companionMemories: {},
     companionPortraits: {},
     companionContexts: {},
+    companionPhones: {},
     activeCompanionId: 'comp_default_1',
     activeStoryCompanionId: null,
+    activeSlotId: null,
     animeJourneyHistory: [],
     checkpoint: null,
   };
@@ -2553,10 +2601,22 @@ export function hydrateArkStateFromPayload(
       reason = parsed.autoSaveReason;
     }
 
+    const hasPersistedStoryContent =
+      (Array.isArray(parsed.turns) && parsed.turns.length > 0) ||
+      (Array.isArray(parsed.slots) && parsed.slots.length > 0) ||
+      Boolean(
+        parsed.portraitBank &&
+          typeof parsed.portraitBank === 'object' &&
+          Array.isArray((parsed.portraitBank as { portraits?: unknown }).portraits) &&
+          ((parsed.portraitBank as { portraits?: unknown[] }).portraits?.length || 0) > 0,
+      );
+
     if (parsed.player && typeof parsed.player === 'object') {
       base.player = { ...base.player, ...(parsed.player as Record<string, unknown>) };
-      if (base.player.name === 'Trần Thiện') base.player.name = '';
-      if (base.player.pronoun === 'anh Thiện') base.player.pronoun = '';
+      if (!hasPersistedStoryContent) {
+        if (base.player.name === 'Trần Thiện') base.player.name = '';
+        if (base.player.pronoun === 'anh Thiện') base.player.pronoun = '';
+      }
     }
     if (parsed.world && typeof parsed.world === 'object') {
       base.world = { ...base.world, ...(parsed.world as Record<string, unknown>) };
@@ -2677,6 +2737,9 @@ export function hydrateArkStateFromPayload(
             : {}),
           ...(cleanSlot(rec.fanfic) ? { fanfic: cleanSlot(rec.fanfic) } : {}),
           ...(cleanSlot(rec.utility) ? { utility: cleanSlot(rec.utility) } : {}),
+          ...(cleanSlot(rec.showbizPhone)
+            ? { showbizPhone: cleanSlot(rec.showbizPhone) }
+            : {}),
         };
       };
 
@@ -2807,7 +2870,21 @@ export function hydrateArkStateFromPayload(
           typeof parsedConfig.autoStoryBeatsEnabled === 'boolean'
             ? parsedConfig.autoStoryBeatsEnabled
             : true,
+        chatImageMaxInputMb: clampChatImageMaxInputMb(
+          parsedConfig.chatImageMaxInputMb,
+        ),
+        chatImageMaxDimension: clampChatImageMaxDimension(
+          parsedConfig.chatImageMaxDimension,
+        ),
+        chatImageQuality: clampChatImageQuality(parsedConfig.chatImageQuality),
+        chatImageAutoClearAfterReply:
+          typeof parsedConfig.chatImageAutoClearAfterReply === 'boolean'
+            ? parsedConfig.chatImageAutoClearAfterReply
+            : true,
         taskModels: sanitizeTaskModels(parsedConfig.taskModels),
+        showbizPhoneConfig: sanitizeShowbizPhoneApiConfig(
+          parsedConfig.showbizPhoneConfig,
+        ),
         comfyuiWorkflowJson:
           legacyWorkflowJson || activeWf?.workflowJson || '',
         comfyuiNegativePrompt:
@@ -2838,6 +2915,7 @@ export function hydrateArkStateFromPayload(
     if (parsed.context && typeof parsed.context === 'object') {
       base.context = { ...base.context, ...(parsed.context as Partial<ContextConfig>) };
       if (
+        !hasPersistedStoryContent &&
         typeof base.context.entitiesNote === 'string' &&
         /Trần Thiện|anh Thiện/i.test(base.context.entitiesNote)
       ) {
@@ -2861,6 +2939,20 @@ export function hydrateArkStateFromPayload(
           ...(slot.portraitBank
             ? { portraitBank: normalizePortraitBank(slot.portraitBank) }
             : {}),
+          ...(slot.showbizPhone
+            ? { showbizPhone: normalizeShowbizPhoneState(slot.showbizPhone) }
+            : {}),
+          ...(slot.companionSnapshot && typeof slot.companionSnapshot === 'object'
+            ? {
+                companionSnapshot: normalizeCompanionProfile(
+                  slot.companionSnapshot as CompanionProfile,
+                ),
+              }
+            : {}),
+          ...(typeof slot.activeStoryCompanionId === 'string' ||
+          slot.activeStoryCompanionId === null
+            ? { activeStoryCompanionId: slot.activeStoryCompanionId }
+            : {}),
         };
       }) as ArkState['slots'];
     }
@@ -2873,6 +2965,16 @@ export function hydrateArkStateFromPayload(
           : {}),
         ...(cp.portraitBank
           ? { portraitBank: normalizePortraitBank(cp.portraitBank) }
+          : {}),
+        ...(cp.showbizPhone
+          ? { showbizPhone: normalizeShowbizPhoneState(cp.showbizPhone) }
+          : {}),
+        ...(cp.companionSnapshot && typeof cp.companionSnapshot === 'object'
+          ? {
+              companionSnapshot: normalizeCompanionProfile(
+                cp.companionSnapshot as CompanionProfile,
+              ),
+            }
           : {}),
       };
     }
@@ -2890,6 +2992,9 @@ export function hydrateArkStateFromPayload(
     }
     if (parsed.portraitBank && typeof parsed.portraitBank === 'object') {
       base.portraitBank = normalizePortraitBank(parsed.portraitBank);
+    }
+    if (parsed.showbizPhone && typeof parsed.showbizPhone === 'object') {
+      base.showbizPhone = normalizeShowbizPhoneState(parsed.showbizPhone);
     }
     if (Array.isArray(parsed.companions) && parsed.companions.length) {
       base.companions = parsed.companions.map((c: CompanionProfile) =>
@@ -2964,6 +3069,18 @@ export function hydrateArkStateFromPayload(
       }
       base.companionContexts = normalizedContextsMap;
     }
+    if (
+      parsed.companionPhones &&
+      typeof parsed.companionPhones === 'object'
+    ) {
+      const normalizedPhonesMap: Record<string, ShowbizPhoneState> = {};
+      for (const [k, v] of Object.entries(
+        parsed.companionPhones as Record<string, unknown>,
+      )) {
+        normalizedPhonesMap[k] = normalizeShowbizPhoneState(v);
+      }
+      base.companionPhones = normalizedPhonesMap;
+    }
     if (typeof parsed.activeCompanionId === 'string' && parsed.activeCompanionId) {
       base.activeCompanionId = parsed.activeCompanionId;
     }
@@ -2975,6 +3092,9 @@ export function hydrateArkStateFromPayload(
     } else {
       base.activeStoryCompanionId = resolveActiveStoryCompanionKey(base);
     }
+    if (typeof parsed.activeSlotId === 'string' || parsed.activeSlotId === null) {
+      base.activeSlotId = parsed.activeSlotId;
+    }
     const restoredView = normalizePersistedActiveView(
       parsed.lastActiveView,
       base.turns.length,
@@ -2985,10 +3105,11 @@ export function hydrateArkStateFromPayload(
   } catch {
     // Fallback cleanly to initial state
   }
-  const activeComp = getActiveCompanionFromState(base);
+  // Chỉ đồng bộ NPC từ Đồng hành thực sự gắn với save hiện tại (tránh kéo nhầm NPC save khác)
+  const storyComp = getStoryBoundCompanionFromState(base);
   base.portraitBank = syncPortraitBankWithCompanion(
     base.portraitBank,
-    activeComp,
+    storyComp,
     base.player.name,
     base.memory?.storyClock,
   );
@@ -2998,7 +3119,7 @@ export function hydrateArkStateFromPayload(
       characterStates: cleanAndDeduplicateCharacterStates(
         base.memory.characterStates,
         {
-          comp: activeComp,
+          comp: storyComp,
           fallbackMcName: base.player.name,
           knownValidNames: (base.portraitBank?.portraits || [])
             .filter((p) => !isPortraitAutoScannedUnconfirmed(p))
@@ -3121,14 +3242,17 @@ function buildPersistPayload(
     storyImage: compactStoryImage,
     memory: state.memory || createDefaultMemoryConfig(),
     portraitBank: state.portraitBank || createDefaultPortraitBank(),
+    showbizPhone: state.showbizPhone || createDefaultShowbizPhoneState(),
     companions: state.companions || [],
     companionStories: state.companionStories || {},
     companionMemories: state.companionMemories || {},
     companionPortraits: state.companionPortraits || {},
     companionContexts: state.companionContexts || {},
+    companionPhones: state.companionPhones || {},
     animeJourneyHistory: state.animeJourneyHistory || [],
     activeCompanionId: state.activeCompanionId || '',
     activeStoryCompanionId: state.activeStoryCompanionId ?? null,
+    activeSlotId: state.activeSlotId ?? null,
   };
 }
 
@@ -4241,6 +4365,298 @@ export function persistState(
   };
 }
 
+export function createDefaultShowbizPhoneState(): ShowbizPhoneState {
+  return {
+    contacts: [],
+    dmThreads: {},
+    groups: [],
+    posts: [],
+  };
+}
+
+export function sanitizeShowbizPhoneApiConfig(
+  raw: unknown,
+): ShowbizPhoneApiConfig {
+  if (!raw || typeof raw !== 'object') return {};
+  const rec = raw as Record<string, unknown>;
+  const proxyUrl =
+    typeof rec.proxyUrl === 'string' ? rec.proxyUrl.trim().slice(0, 500) : '';
+  const proxyKey =
+    typeof rec.proxyKey === 'string' ? rec.proxyKey.trim().slice(0, 500) : '';
+  const model =
+    typeof rec.model === 'string' ? rec.model.trim().slice(0, 160) : '';
+  const apiProtocol =
+    rec.apiProtocol === 'openai' ||
+    rec.apiProtocol === 'auto' ||
+    rec.apiProtocol === 'gemini'
+      ? rec.apiProtocol
+      : '';
+  const useServerProxy =
+    typeof rec.useServerProxy === 'boolean' ? rec.useServerProxy : undefined;
+  return {
+    ...(proxyUrl ? { proxyUrl } : {}),
+    ...(proxyKey ? { proxyKey } : {}),
+    ...(model ? { model } : {}),
+    ...(apiProtocol ? { apiProtocol } : {}),
+    ...(typeof useServerProxy === 'boolean' ? { useServerProxy } : {}),
+  };
+}
+
+export function normalizeShowbizPhoneState(raw: unknown): ShowbizPhoneState {
+  if (!raw || typeof raw !== 'object') {
+    return createDefaultShowbizPhoneState();
+  }
+  const rec = raw as Record<string, unknown>;
+  const now = Date.now();
+
+  const contacts: ShowbizPhoneContact[] = Array.isArray(rec.contacts)
+    ? rec.contacts
+        .map((item, idx): ShowbizPhoneContact | null => {
+          if (!item || typeof item !== 'object') return null;
+          const c = item as Record<string, unknown>;
+          const name = typeof c.name === 'string' ? c.name.trim() : '';
+          if (!name) return null;
+          const id =
+            typeof c.id === 'string' && c.id.trim()
+              ? c.id.trim()
+              : `sb_c_${idx}_${now}`;
+          const handle =
+            typeof c.handle === 'string' && c.handle.trim()
+              ? c.handle.trim()
+              : `@${name
+                  .normalize('NFD')
+                  .replace(/[\u0300-\u036f]/g, '')
+                  .replace(/đ/gi, 'd')
+                  .replace(/[^a-zA-Z0-9]+/g, '')
+                  .toLowerCase() || `npc${idx + 1}`}`;
+          return {
+            id,
+            name,
+            handle: handle.startsWith('@') ? handle : `@${handle}`,
+            role: typeof c.role === 'string' ? c.role.trim() : '',
+            bio: typeof c.bio === 'string' ? c.bio.trim() : '',
+            avatarData: typeof c.avatarData === 'string' ? c.avatarData : '',
+            relation: typeof c.relation === 'string' ? c.relation.trim() : '',
+            source: c.source === 'manual' ? 'manual' : 'save_npc',
+            verified: Boolean(c.verified),
+            addedAt:
+              typeof c.addedAt === 'number' && Number.isFinite(c.addedAt)
+                ? c.addedAt
+                : now,
+            lastActiveAt:
+              typeof c.lastActiveAt === 'number' &&
+              Number.isFinite(c.lastActiveAt)
+                ? c.lastActiveAt
+                : undefined,
+          };
+        })
+        .filter((x): x is ShowbizPhoneContact => Boolean(x))
+    : [];
+
+  const normalizeMessages = (arr: unknown): ShowbizPhoneMessage[] =>
+    Array.isArray(arr)
+      ? arr
+          .map((m, idx): ShowbizPhoneMessage | null => {
+            if (!m || typeof m !== 'object') return null;
+            const msg = m as Record<string, unknown>;
+            const text = typeof msg.text === 'string' ? msg.text.trim() : '';
+            if (!text) return null;
+            return {
+              id:
+                typeof msg.id === 'string' && msg.id.trim()
+                  ? msg.id.trim()
+                  : `sb_m_${idx}_${now}`,
+              senderId:
+                typeof msg.senderId === 'string' && msg.senderId.trim()
+                  ? msg.senderId.trim()
+                  : msg.isMc
+                    ? 'mc'
+                    : 'npc',
+              senderName:
+                typeof msg.senderName === 'string' && msg.senderName.trim()
+                  ? msg.senderName.trim()
+                  : msg.isMc
+                    ? 'Bạn'
+                    : 'NPC',
+              text,
+              createdAt:
+                typeof msg.createdAt === 'number' &&
+                Number.isFinite(msg.createdAt)
+                  ? msg.createdAt
+                  : now,
+              isMc: Boolean(msg.isMc || msg.senderId === 'mc'),
+            };
+          })
+          .filter((x): x is ShowbizPhoneMessage => Boolean(x))
+      : [];
+
+  const dmThreads: Record<string, ShowbizPhoneMessage[]> = {};
+  if (rec.dmThreads && typeof rec.dmThreads === 'object') {
+    for (const [contactId, rawMsgs] of Object.entries(
+      rec.dmThreads as Record<string, unknown>,
+    )) {
+      if (!contactId.trim()) continue;
+      dmThreads[contactId] = normalizeMessages(rawMsgs).slice(-120);
+    }
+  }
+
+  const groups: ShowbizPhoneGroup[] = Array.isArray(rec.groups)
+    ? rec.groups
+        .map((g, idx): ShowbizPhoneGroup | null => {
+          if (!g || typeof g !== 'object') return null;
+          const grp = g as Record<string, unknown>;
+          const name = typeof grp.name === 'string' ? grp.name.trim() : '';
+          if (!name) return null;
+          const memberIds = Array.isArray(grp.memberIds)
+            ? Array.from(
+                new Set(
+                  grp.memberIds
+                    .map((id) => (typeof id === 'string' ? id.trim() : ''))
+                    .filter(Boolean),
+                ),
+              )
+            : [];
+          return {
+            id:
+              typeof grp.id === 'string' && grp.id.trim()
+                ? grp.id.trim()
+                : `sb_g_${idx}_${now}`,
+            name,
+            topic: typeof grp.topic === 'string' ? grp.topic.trim() : '',
+            memberIds,
+            messages: normalizeMessages(grp.messages).slice(-140),
+            createdAt:
+              typeof grp.createdAt === 'number' && Number.isFinite(grp.createdAt)
+                ? grp.createdAt
+                : now,
+            updatedAt:
+              typeof grp.updatedAt === 'number' && Number.isFinite(grp.updatedAt)
+                ? grp.updatedAt
+                : now,
+          };
+        })
+        .filter((x): x is ShowbizPhoneGroup => Boolean(x))
+    : [];
+
+  const posts: ShowbizPhonePost[] = Array.isArray(rec.posts)
+    ? rec.posts
+        .map((p, idx): ShowbizPhonePost | null => {
+          if (!p || typeof p !== 'object') return null;
+          const post = p as Record<string, unknown>;
+          const content =
+            typeof post.content === 'string' ? post.content.trim() : '';
+          if (!content) return null;
+          const comments: ShowbizPhoneComment[] = Array.isArray(post.comments)
+            ? post.comments
+                .map((cm, cIdx): ShowbizPhoneComment | null => {
+                  if (!cm || typeof cm !== 'object') return null;
+                  const cObj = cm as Record<string, unknown>;
+                  const text =
+                    typeof cObj.text === 'string' ? cObj.text.trim() : '';
+                  if (!text) return null;
+                  return {
+                    id:
+                      typeof cObj.id === 'string' && cObj.id.trim()
+                        ? cObj.id.trim()
+                        : `sb_cm_${cIdx}_${now}`,
+                    authorId:
+                      typeof cObj.authorId === 'string' && cObj.authorId.trim()
+                        ? cObj.authorId.trim()
+                        : cObj.isMc
+                          ? 'mc'
+                          : 'npc',
+                    authorName:
+                      typeof cObj.authorName === 'string' &&
+                      cObj.authorName.trim()
+                        ? cObj.authorName.trim()
+                        : 'Ẩn danh',
+                    authorHandle:
+                      typeof cObj.authorHandle === 'string'
+                        ? cObj.authorHandle.trim()
+                        : undefined,
+                    text,
+                    createdAt:
+                      typeof cObj.createdAt === 'number' &&
+                      Number.isFinite(cObj.createdAt)
+                        ? cObj.createdAt
+                        : now,
+                    isMc: Boolean(cObj.isMc || cObj.authorId === 'mc'),
+                  };
+                })
+                .filter((x): x is ShowbizPhoneComment => Boolean(x))
+            : [];
+
+          return {
+            id:
+              typeof post.id === 'string' && post.id.trim()
+                ? post.id.trim()
+                : `sb_p_${idx}_${now}`,
+            authorId:
+              typeof post.authorId === 'string' && post.authorId.trim()
+                ? post.authorId.trim()
+                : post.isMc
+                  ? 'mc'
+                  : 'npc',
+            authorName:
+              typeof post.authorName === 'string' && post.authorName.trim()
+                ? post.authorName.trim()
+                : 'Ẩn danh',
+            authorHandle:
+              typeof post.authorHandle === 'string' && post.authorHandle.trim()
+                ? post.authorHandle.trim()
+                : '@user',
+            authorRole:
+              typeof post.authorRole === 'string' ? post.authorRole.trim() : '',
+            authorAvatarData:
+              typeof post.authorAvatarData === 'string'
+                ? post.authorAvatarData
+                : '',
+            isMc: Boolean(post.isMc || post.authorId === 'mc'),
+            content,
+            locationTag:
+              typeof post.locationTag === 'string'
+                ? post.locationTag.trim()
+                : '',
+            hashtags: Array.isArray(post.hashtags)
+              ? post.hashtags
+                  .map((h) => (typeof h === 'string' ? h.trim() : ''))
+                  .filter(Boolean)
+                  .slice(0, 8)
+              : [],
+            likes:
+              typeof post.likes === 'number' && Number.isFinite(post.likes)
+                ? Math.max(0, Math.round(post.likes))
+                : 0,
+            likedByMc: Boolean(post.likedByMc),
+            comments,
+            createdAt:
+              typeof post.createdAt === 'number' &&
+              Number.isFinite(post.createdAt)
+                ? post.createdAt
+                : now,
+            bridgedToStoryAt:
+              typeof post.bridgedToStoryAt === 'number' &&
+              Number.isFinite(post.bridgedToStoryAt)
+                ? post.bridgedToStoryAt
+                : undefined,
+          };
+        })
+        .filter((x): x is ShowbizPhonePost => Boolean(x))
+        .slice(0, 80)
+    : [];
+
+  return {
+    contacts,
+    dmThreads,
+    groups,
+    posts,
+    lastSyncedAt:
+      typeof rec.lastSyncedAt === 'number' && Number.isFinite(rec.lastSyncedAt)
+        ? rec.lastSyncedAt
+        : undefined,
+  };
+}
+
 export function getActiveCompanionFromState(state: ArkState): CompanionProfile {
   if (!state || !Array.isArray(state.companions) || !state.companions.length) {
     return createDefaultCompanion();
@@ -4249,6 +4665,42 @@ export function getActiveCompanionFromState(state: ArkState): CompanionProfile {
     state.companions.find((c) => c.id === state.activeCompanionId) ||
     state.companions[0]
   );
+}
+
+/**
+ * Trả về hồ sơ Đồng hành ĐANG GẮN TRỰC TIẾP với save/lượt truyện hiện tại.
+ * Nếu đang chơi một Save Slot độc lập / thế giới độc lập (`activeStoryCompanionId` là null hoặc không khớp),
+ * trả về `undefined` để tuyệt đối không kéo nhầm NPC/hồ sơ từ save hoặc Đồng hành khác sang!
+ */
+export function getStoryBoundCompanionFromState(
+  state: ArkState | undefined | null,
+): CompanionProfile | undefined {
+  if (!state || !Array.isArray(state.companions) || !state.companions.length) {
+    return undefined;
+  }
+  const boundId =
+    typeof state.activeStoryCompanionId === 'string'
+      ? state.activeStoryCompanionId.trim()
+      : '';
+  if (!boundId) {
+    // Nếu đang ở một save slot đã lưu kèm companionSnapshot, ưu tiên snapshot cô lập của chính slot đó
+    if (state.activeSlotId && Array.isArray(state.slots)) {
+      const slot = state.slots.find((s) => s.id === state.activeSlotId);
+      if (slot?.companionSnapshot) {
+        return slot.companionSnapshot;
+      }
+    }
+    return undefined;
+  }
+  const found = state.companions.find((c) => c.id === boundId);
+  if (found) return found;
+  if (state.activeSlotId && Array.isArray(state.slots)) {
+    const slot = state.slots.find((s) => s.id === state.activeSlotId);
+    if (slot?.companionSnapshot) {
+      return slot.companionSnapshot;
+    }
+  }
+  return undefined;
 }
 
 export function triggerDownloadJson(filename: string, obj: unknown): void {

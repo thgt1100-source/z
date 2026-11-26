@@ -76,6 +76,7 @@ import {
 import { buildRelationshipGraph } from '../utils/relationshipGraphEngine';
 import { splitNarrativeAndMeta } from '../utils/saveParser';
 import { matchesQuery } from '../utils/search';
+import { getShowbizMcProfile } from '../utils/showbizPhone';
 import { getActiveCompanionFromState, triggerDownloadJson } from '../utils/storage';
 import { CharacterNameBadge } from './CharacterNameBadge';
 import {
@@ -3438,6 +3439,7 @@ export function CompanionView({
             portraitBank={state.portraitBank}
             appConfig={state.config}
             activeCompanionName={cur.name || 'Đồng nhân'}
+            activeMainName={getShowbizMcProfile(state).name}
             storyClock={state.memory?.storyClock}
             hasSeedreamConfigured={hasImageGeneratorConfigured(state.config)}
             generatingPortraitIds={generatingPortraitIds}

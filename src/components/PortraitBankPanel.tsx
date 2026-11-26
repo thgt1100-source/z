@@ -60,6 +60,7 @@ import {
   formatAgeBirthdayLabel,
   isCharacterOnlineInSet,
   lookupKnownCelebrityProfile,
+  resolveActiveMainPortraitId,
   resolveEffectiveCharacterAge,
 } from '../utils/characterUtils';
 import {
@@ -87,6 +88,7 @@ interface PortraitBankPanelProps {
   portraitBank: PortraitBankConfig;
   appConfig?: AppConfig;
   activeCompanionName: string;
+  activeMainName?: string;
   storyClock?: StoryClockState;
   hasSeedreamConfigured: boolean;
   generatingPortraitIds: string[];
@@ -149,6 +151,7 @@ export function PortraitBankPanel({
   portraitBank,
   appConfig,
   activeCompanionName,
+  activeMainName,
   storyClock,
   hasSeedreamConfigured,
   generatingPortraitIds,
@@ -401,6 +404,10 @@ export function PortraitBankPanel({
   };
 
   const portraits = portraitBank.portraits || [];
+  const protectedMainPortraitId = useMemo(
+    () => resolveActiveMainPortraitId(portraits, activeMainName),
+    [portraits, activeMainName],
+  );
   const withImageCount = useMemo(
     () => portraits.filter((p) => Boolean(p.imageData)).length,
     [portraits],
@@ -423,11 +430,11 @@ export function PortraitBankPanel({
   );
 
   // Auto-clean blatant non-person / cultivation / lyric junk entries when opening Portrait Bank
-  // (preserves MC and all valid real characters without requiring manual deletion)
+  // (preserves active Main and all valid real characters without requiring manual deletion)
   const autoCleanSigRef = useRef<string>('');
   useEffect(() => {
     const hardJunk = portraits.filter((p) => {
-      if (p.isMc) return false;
+      if (p.id === protectedMainPortraitId) return false;
       const reason = suspectedJunkMap.get(p.id);
       return reason === 'non_person' || reason === 'lyric_slang';
     });
@@ -441,40 +448,28 @@ export function PortraitBankPanel({
     const junkIds = new Set(hardJunk.map((p) => p.id));
     onUpdatePortraitBank((prev) => ({
       ...prev,
-      portraits: (prev.portraits || []).filter((p) => p.isMc || !junkIds.has(p.id)),
+      portraits: (prev.portraits || []).filter(
+        (p) => p.id === protectedMainPortraitId || !junkIds.has(p.id),
+      ),
     }));
-  }, [portraits, suspectedJunkMap, onUpdatePortraitBank]);
+  }, [portraits, protectedMainPortraitId, suspectedJunkMap, onUpdatePortraitBank]);
 
   const handleQuickDeleteSuspectedJunk = () => {
-    if (!suspectedJunkPortraits.length) {
-      onCleanJunkPortraits();
-      triggerConfirm('clean_junk');
-      onNotify?.('Đã rà soát — không phát hiện tên NPC rác mới.');
-      return;
-    }
-    const junkIds = new Set(suspectedJunkPortraits.map((p) => p.id));
-    const removedNames = suspectedJunkPortraits.map((p) => p.name);
-    onUpdatePortraitBank((prev) => ({
-      ...prev,
-      portraits: (prev.portraits || []).filter((p) => !junkIds.has(p.id)),
-    }));
-    // Also trigger full junk cleanup across Character States & Companion roster
+    // Delegate atomically to onCleanJunkPortraits so Portrait Bank, Companion NPCs,
+    // Character States, and localStorage/IndexedDB are cleaned & persisted in one pass
+    // without any stale stateRef overwrite race.
     onCleanJunkPortraits();
     triggerConfirm('clean_junk');
     if (filter === 'junk') {
       setFilter('all');
     }
-    const preview = removedNames.slice(0, 4).join(', ');
-    onNotify?.(
-      `Đã xóa nhanh ${removedNames.length} mục NPC rác (${preview}${
-        removedNames.length > 4 ? '...' : ''
-      }) mà không ảnh hưởng tới nhân vật hợp lệ.`,
-    );
   };
 
   const filteredPortraits = useMemo(() => {
     const sorted = [...portraits].sort((a, b) => {
-      if (a.isMc !== b.isMc) return a.isMc ? -1 : 1;
+      const aMain = a.id === protectedMainPortraitId;
+      const bMain = b.id === protectedMainPortraitId;
+      if (aMain !== bMain) return aMain ? -1 : 1;
       const aPin = a.pinned ? 1 : 0;
       const bPin = b.pinned ? 1 : 0;
       if (aPin !== bPin) return bPin - aPin;
@@ -498,7 +493,7 @@ export function PortraitBankPanel({
       }
       return true;
     });
-  }, [portraits, filter, query, suspectedJunkMap]);
+  }, [portraits, protectedMainPortraitId, filter, query, suspectedJunkMap]);
 
   const onlineCharacterKeySet = useMemo(
     () => buildOnlineCharacterKeySet(onlineCharacterNames),
@@ -795,11 +790,33 @@ export function PortraitBankPanel({
     }));
   };
 
-  const handleDeleteEntry = (id: string) => {
+  const handleDeleteEntry = (id: string, name?: string) => {
+    if (id === protectedMainPortraitId) {
+      onNotify?.(
+        `Không thể xóa nhân vật chính (Main) hiện tại${name ? ` "${name}"` : ''}. Hãy gắn thẻ Main cho nhân vật khác trước nếu muốn xóa thẻ này.`,
+        'err',
+      );
+      return;
+    }
     onUpdatePortraitBank((prev) => ({
       ...prev,
       portraits: (prev.portraits || []).filter((p) => p.id !== id),
+      relationshipGroups: (prev.relationshipGroups || []).map((g) => ({
+        ...g,
+        memberIds: (g.memberIds || []).filter((mid) => mid !== id),
+      })),
+      relationshipOverrides: (prev.relationshipOverrides || []).filter(
+        (ov) => ov.sourceId !== id && ov.targetId !== id,
+      ),
     }));
+    if (lightboxId === id) setLightboxId(null);
+    if (editingId === id) setEditingId(null);
+    if (promptPreviewId === id) setPromptPreviewId(null);
+    if (editingPromptId === id) setEditingPromptId(null);
+    onNotify?.(
+      `Đã xóa ${name ? `"${name}"` : 'nhân vật'} khỏi Thư viện Ảnh của save hiện tại.`,
+      'info',
+    );
   };
 
   const applyExternalAvatarToPortrait = (
@@ -990,15 +1007,8 @@ export function PortraitBankPanel({
         <div className="flex flex-wrap items-center gap-1.5">
           <button
             type="button"
-            onClick={() => {
-              if (suspectedJunkPortraits.length > 0) {
-                handleQuickDeleteSuspectedJunk();
-              } else {
-                onCleanJunkPortraits();
-                triggerConfirm('clean_junk');
-              }
-            }}
-            title="Xóa nhanh các mục NPC rác dạng lyric nhạc, câu cảm thán, tên trêu đùa/chế tên hoặc tên phi nhân vật mà không xóa nhân vật hợp lệ"
+            onClick={handleQuickDeleteSuspectedJunk}
+            title="Xóa vĩnh viễn các mục NPC rác (tên viết tắt 1–2 ký tự, tên rút gọn trùng đuôi nhân vật có sẵn, địa danh/núi sông/cảnh vật/chiêu thức, lyric/cảm thán) và lưu lại ngay"
             className="inline-flex min-h-[32px] items-center gap-1 rounded-xl bg-amber-500/14 px-2.5 text-[11px] font-semibold text-amber-200 ring-1 ring-inset ring-amber-400/28 transition-all hover:bg-amber-500/22 whitespace-nowrap"
           >
             {isConfirmed('clean_junk') ? (
@@ -2970,23 +2980,37 @@ export function PortraitBankPanel({
                           )}
                         </div>
 
-                        <button
-                          type="button"
-                          aria-expanded={isToolsOpen}
-                          onClick={() => toggleToolsExpand(p.id)}
-                          className={`inline-flex min-h-[34px] shrink-0 items-center gap-1 whitespace-nowrap rounded-lg px-2 text-[11px] font-semibold ring-1 ring-inset transition-colors ${
-                            isToolsOpen
-                              ? 'bg-slate-700/70 text-slate-100 ring-white/[0.16]'
-                              : 'bg-white/[0.045] text-slate-300 ring-white/[0.08] hover:bg-white/[0.10] hover:text-white'
-                          }`}
-                        >
-                          <span>Công cụ</span>
-                          {isToolsOpen ? (
-                            <ChevronUp className="h-3 w-3" />
-                          ) : (
-                            <ChevronDown className="h-3 w-3" />
+                        <div className="flex items-center gap-1">
+                          {p.id !== protectedMainPortraitId && (
+                            <button
+                              type="button"
+                              aria-label={`Xóa ${p.name} khỏi thư viện`}
+                              title={`Xóa "${p.name}" khỏi Thư viện Ảnh save hiện tại`}
+                              onClick={() => handleDeleteEntry(p.id, p.name)}
+                              className="inline-flex min-h-[34px] shrink-0 items-center gap-1 whitespace-nowrap rounded-lg bg-rose-500/14 px-2 text-[11px] font-semibold text-rose-200 ring-1 ring-inset ring-rose-400/30 transition-colors hover:bg-rose-500/24"
+                            >
+                              <Trash2 className="h-3 w-3" />
+                              <span>Xóa NV</span>
+                            </button>
                           )}
-                        </button>
+                          <button
+                            type="button"
+                            aria-expanded={isToolsOpen}
+                            onClick={() => toggleToolsExpand(p.id)}
+                            className={`inline-flex min-h-[34px] shrink-0 items-center gap-1 whitespace-nowrap rounded-lg px-2 text-[11px] font-semibold ring-1 ring-inset transition-colors ${
+                              isToolsOpen
+                                ? 'bg-slate-700/70 text-slate-100 ring-white/[0.16]'
+                                : 'bg-white/[0.045] text-slate-300 ring-white/[0.08] hover:bg-white/[0.10] hover:text-white'
+                            }`}
+                          >
+                            <span>Công cụ</span>
+                            {isToolsOpen ? (
+                              <ChevronUp className="h-3 w-3" />
+                            ) : (
+                              <ChevronDown className="h-3 w-3" />
+                            )}
+                          </button>
+                        </div>
                       </div>
 
                       {/* Tier 2: Secondary & advanced portrait tools */}
@@ -3094,17 +3118,6 @@ export function PortraitBankPanel({
                                   <span>Xóa ảnh</span>
                                 </button>
                               </>
-                            )}
-                            {!p.isMc && (
-                              <button
-                                type="button"
-                                aria-label={`Xóa ${p.name} khỏi thư viện`}
-                                onClick={() => handleDeleteEntry(p.id)}
-                                className="inline-flex min-h-[32px] shrink-0 items-center gap-1 whitespace-nowrap rounded-lg bg-rose-500/14 px-2 text-[11px] font-semibold text-rose-200 ring-1 ring-inset ring-rose-400/28 transition-colors hover:bg-rose-500/22"
-                              >
-                                <Trash2 className="h-3 w-3" />
-                                <span>Xóa NV</span>
-                              </button>
                             )}
                           </div>
                         </div>

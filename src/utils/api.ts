@@ -31,7 +31,14 @@ import {
   type WorldSetupNpcDraft,
 } from '../types/ark';
 import {
+  clampChatImageMaxDimension,
+  clampChatImageQuality,
+  formatBytesCompact,
+  normalizeChatImageForVisionApi,
+} from './chatImageUpload';
+import {
   analyzeCharacterDirectPresence,
+  areIdentityKeysShadowMatch,
   buildAllowedRosterKeys,
   buildCultivationNonNpcKeys,
   cleanAndDeduplicateCharacterStates,
@@ -60,6 +67,7 @@ import {
   isNonPersonCultivationOrWorldTerm,
   isPlayfulTeasingOrParodyName,
   isPortraitAutoScannedUnconfirmed,
+  isShortCodeOrBracketedJunkName,
   isSoloPoseExpressionSnippet,
   isTeasingOrSpellingVariantOf,
   lookupKnownCelebrityProfile,
@@ -100,7 +108,7 @@ import {
   DEFAULT_LATENT_SIZE,
   DEFAULT_LATENT_STEPS,
   DEFAULT_SAFETY,
-  getActiveCompanionFromState,
+  getStoryBoundCompanionFromState,
   INFORMATION_BOUNDARY_MODULE,
   INFORMATION_BOUNDARY_MODULE_ID,
   MIND_PRESENTATION_MODULE,
@@ -206,6 +214,7 @@ export const AI_TASK_SLOT_ORDER: AiTaskSlotId[] = [
   'referenceCheck',
   'fanfic',
   'utility',
+  'showbizPhone',
 ];
 
 export const AI_TASK_SLOT_META: Record<
@@ -245,6 +254,13 @@ export const AI_TASK_SLOT_META: Record<
       'Dùng cho Trích xuất trí nhớ/trạng thái, Tóm tắt cuộn, Làm sinh động hồ sơ NPC và AI Dựng thế giới.',
     placeholder: 'VD: gemini-3.5-flash-lite, pg-gemini-3.8-flash...',
   },
+  showbizPhone: {
+    label: 'Slot Model — Điện thoại Showbiz (DM / Nhóm / MXH)',
+    shortLabel: 'Điện thoại',
+    description:
+      'Dùng riêng cho nhắn tin DM, chat nhóm hậu trường và phản ứng MXH trong Điện thoại Showbiz. Tách biệt hoàn toàn khỏi model/ngữ cảnh màn Truyện chính.',
+    placeholder: 'VD: gemini-2.5-flash, gemini-3.5-flash-lite, gpt-4o-mini...',
+  },
 };
 
 export const DEFAULT_PROXY_MODEL = 'gemini-2.5-flash';
@@ -275,6 +291,12 @@ export function resolveModelForTask(
   const mainModel = (config?.model || '').trim() || DEFAULT_PROXY_MODEL;
   if (!slot) {
     return { model: mainModel, isCustomSlot: false, mainModel };
+  }
+  if (slot === 'showbizPhone') {
+    const dedicated = (config?.showbizPhoneConfig?.model || '').trim();
+    if (dedicated) {
+      return { model: dedicated, isCustomSlot: true, slot, mainModel };
+    }
   }
   const custom = (config?.taskModels?.[slot] || '').trim();
   if (custom) {
@@ -783,7 +805,7 @@ export function buildMessagesPayload(
   turnIndex: number,
 ): ChatMessage[] {
   const msgs: ChatMessage[] = [];
-  const activeComp = getActiveCompanionFromState(state);
+  const activeComp = getStoryBoundCompanionFromState(state);
 
   if (activeComp) {
     const npcLines =
@@ -1774,6 +1796,181 @@ export function normalizeMessagesForRequest(
   return merged;
 }
 
+function extractTextFromStructuredContent(raw: unknown): string {
+  if (typeof raw === 'string') return raw;
+  if (Array.isArray(raw)) {
+    let out = '';
+    for (const part of raw) {
+      if (typeof part === 'string') {
+        out += part;
+      } else if (part && typeof part === 'object') {
+        const rec = part as Record<string, unknown>;
+        if (typeof rec.text === 'string') {
+          out += rec.text;
+        } else if (typeof rec.content === 'string') {
+          out += rec.content;
+        } else if (
+          rec.text &&
+          typeof rec.text === 'object' &&
+          typeof (rec.text as Record<string, unknown>).value === 'string'
+        ) {
+          out += String((rec.text as Record<string, unknown>).value);
+        }
+      }
+    }
+    return out;
+  }
+  return '';
+}
+
+function extractPiecesFromModelPayload(json: Record<string, unknown>): {
+  contentPiece: string;
+  reasoningPiece: string;
+} {
+  let contentPiece = '';
+  let reasoningPiece = '';
+
+  const choices = Array.isArray(json.choices) ? json.choices : null;
+  const firstChoice =
+    choices && choices[0] && typeof choices[0] === 'object'
+      ? (choices[0] as Record<string, unknown>)
+      : null;
+
+  const delta =
+    firstChoice?.delta && typeof firstChoice.delta === 'object'
+      ? (firstChoice.delta as Record<string, unknown>)
+      : null;
+  const msgObj =
+    firstChoice?.message && typeof firstChoice.message === 'object'
+      ? (firstChoice.message as Record<string, unknown>)
+      : null;
+
+  if (delta) {
+    contentPiece = extractTextFromStructuredContent(delta.content);
+    const rawReasoning =
+      delta.reasoning_content ?? delta.reasoning ?? delta.thought;
+    reasoningPiece = extractTextFromStructuredContent(rawReasoning);
+  } else if (msgObj) {
+    contentPiece = extractTextFromStructuredContent(msgObj.content);
+    const rawReasoning =
+      msgObj.reasoning_content ?? msgObj.reasoning ?? msgObj.thought;
+    reasoningPiece = extractTextFromStructuredContent(rawReasoning);
+  } else if (
+    Array.isArray(
+      (
+        (json.candidates as Array<Record<string, unknown>> | undefined)?.[0]
+          ?.content as Record<string, unknown> | undefined
+      )?.parts,
+    )
+  ) {
+    const parts = (
+      (json.candidates as Array<Record<string, unknown>>)[0].content as {
+        parts: Array<{ text?: string; thought?: boolean }>;
+      }
+    ).parts;
+    for (const part of parts) {
+      if (typeof part?.text !== 'string' || !part.text) continue;
+      if (part.thought) {
+        reasoningPiece += part.text;
+      } else {
+        contentPiece += part.text;
+      }
+    }
+  } else if (typeof firstChoice?.text === 'string') {
+    contentPiece = firstChoice.text;
+  } else {
+    const fallback = json.delta ?? json.content ?? json.text ?? '';
+    contentPiece = extractTextFromStructuredContent(fallback);
+  }
+
+  return { contentPiece, reasoningPiece };
+}
+
+function replaceAttachedImageUrlsInMessages(
+  messages: ChatMessage[],
+  imageUrls: string[],
+): ChatMessage[] {
+  let lastUserIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i]?.role === 'user') {
+      lastUserIdx = i;
+      break;
+    }
+  }
+  if (lastUserIdx < 0) return messages;
+  return messages.map((msg, idx) => {
+    if (idx !== lastUserIdx || !Array.isArray(msg.content)) return msg;
+    const textParts = msg.content.filter((p) => p.type === 'text');
+    const nextParts: MessageContentPart[] = [
+      ...textParts,
+      ...imageUrls.map((url) => ({
+        type: 'image_url' as const,
+        image_url: { url },
+      })),
+    ];
+    return { ...msg, content: nextParts };
+  });
+}
+
+function isPayloadTooLargeFailure(status: number, errText: string): boolean {
+  if (status === 413) return true;
+  return /\b(?:413|payload\s+too\s+large|request\s+entity\s+too\s+large|body\s+size|too\s+large|exceeds?\s+(?:the\s+)?(?:max|limit|size)|image\s+too\s+large)\b/i.test(
+    errText,
+  );
+}
+
+class StreamIdleTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StreamIdleTimeoutError';
+  }
+}
+
+async function readChunkWithIdleTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  idleTimeoutMs: number,
+  userSignal: AbortSignal,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  if (userSignal.aborted) {
+    const abortErr = new Error('Đã dừng theo yêu cầu người dùng.');
+    abortErr.name = 'AbortError';
+    throw abortErr;
+  }
+
+  let timer: ReturnType<typeof globalThis.setTimeout> | null = null;
+  let onUserAbort: (() => void) | null = null;
+
+  try {
+    return await new Promise<ReadableStreamReadResult<Uint8Array>>(
+      (resolve, reject) => {
+        onUserAbort = () => {
+          const abortErr = new Error('Đã dừng theo yêu cầu người dùng.');
+          abortErr.name = 'AbortError';
+          reject(abortErr);
+        };
+        userSignal.addEventListener('abort', onUserAbort, { once: true });
+
+        timer = globalThis.setTimeout(() => {
+          reject(
+            new StreamIdleTimeoutError(
+              `Luồng stream bị treo quá ${Math.round(idleTimeoutMs / 1000)} giây không có dữ liệu mới.`,
+            ),
+          );
+        }, idleTimeoutMs);
+
+        reader.read().then(resolve, reject);
+      },
+    );
+  } finally {
+    if (timer !== null) {
+      globalThis.clearTimeout(timer);
+    }
+    if (onUserAbort) {
+      userSignal.removeEventListener('abort', onUserAbort);
+    }
+  }
+}
+
 export async function executeModelTurn(options: {
   state: ArkState;
   turnIndex: number;
@@ -1807,185 +2004,337 @@ export async function executeModelTurn(options: {
   }
 
   const isGemini = detectIsGeminiProtocol(state.config);
+  const rawAttachedImages = getTurnAttachedImages(targetTurn);
+  const hasAttachedImages = rawAttachedImages.length > 0;
 
-  const endpoints = buildEndpointCandidates(baseUrl, model, state.streamEnabled, isGemini);
+  let activeImageUrls: string[] = [];
+  let compactRetryApplied = false;
+
+  const normalizeTurnImages = async (opts?: {
+    compactRetry?: boolean;
+  }): Promise<{ ok: boolean; urls: string[]; error?: string }> => {
+    const compact = Boolean(opts?.compactRetry);
+    const configuredDim = clampChatImageMaxDimension(
+      state.config.chatImageMaxDimension,
+    );
+    const configuredQuality = clampChatImageQuality(
+      state.config.chatImageQuality,
+    );
+    const maxDimension = compact
+      ? configuredDim > 0
+        ? Math.min(configuredDim, 1024)
+        : 1024
+      : configuredDim;
+    const quality = compact ? Math.min(configuredQuality, 0.72) : configuredQuality;
+    const perImageBudgetKb = compact
+      ? Math.max(260, Math.floor(1800 / Math.max(1, rawAttachedImages.length)))
+      : Math.max(520, Math.floor(4200 / Math.max(1, rawAttachedImages.length)));
+
+    const urls: string[] = [];
+    const errors: string[] = [];
+    let totalBytes = 0;
+
+    for (let i = 0; i < rawAttachedImages.length; i += 1) {
+      if (signal.aborted) {
+        return { ok: false, urls: [], error: 'Đã dừng.' };
+      }
+      const res = await normalizeChatImageForVisionApi(rawAttachedImages[i], {
+        maxDimension,
+        quality,
+        targetMaxPayloadKb: perImageBudgetKb,
+        forceRecompress: compact,
+        signal,
+      });
+      if (res.ok && res.image) {
+        urls.push(res.image.dataUrl);
+        totalBytes += res.image.bytes;
+      } else if (!isGemini && res.remoteFallbackUrl) {
+        urls.push(res.remoteFallbackUrl);
+      } else {
+        errors.push(
+          `Ảnh #${i + 1}: ${res.error || 'Không chuẩn hóa được dữ liệu ảnh.'}`,
+        );
+      }
+    }
+
+    if (!urls.length) {
+      return {
+        ok: false,
+        urls: [],
+        error:
+          errors.join(' · ') ||
+          'Không thể đọc hoặc chuẩn hóa ảnh đính kèm để gửi lên AI.',
+      };
+    }
+
+    onLog(
+      `[Ảnh đính kèm] Đã chuẩn hóa ${urls.length}/${rawAttachedImages.length} ảnh (${formatBytesCompact(totalBytes)}${compact ? ' · chế độ nén gọn dự phòng' : ''}).`,
+    );
+    return { ok: true, urls };
+  };
+
+  if (hasAttachedImages) {
+    const prep = await normalizeTurnImages({ compactRetry: false });
+    if (signal.aborted) {
+      return { ok: false, text: '', statusLabel: 'Đã dừng', aborted: true };
+    }
+    if (!prep.ok) {
+      onLog(`[Ảnh đính kèm] Lỗi: ${prep.error}`);
+      return {
+        ok: false,
+        text: `[Không thể gửi ảnh đính kèm] ${prep.error}\n\nHãy chọn lại ảnh (JPG/PNG) hoặc giảm độ phân giải trong mục Tùy chọn nén ảnh rồi thử lại.`,
+        statusLabel: 'Lỗi xử lý ảnh',
+      };
+    }
+    activeImageUrls = prep.urls;
+  }
+
   const rawMessages = buildMessagesPayload(state, turnIndex);
   const hasPrefill = Boolean(
     state.tawaPreset?.prefillEnabled && state.tawaPreset?.prefill?.trim(),
   );
   const hasGeminiSafety = Boolean(isGemini || /gemini/i.test(model));
 
-  const attemptVariants: Array<{
-    msgs: ChatMessage[];
-    withSafety: boolean;
-    label: string;
-  }> = [];
+  const buildAttemptVariants = (imageUrls: string[]) => {
+    const msgsWithNormalizedImages = hasAttachedImages
+      ? replaceAttachedImageUrlsInMessages(rawMessages, imageUrls)
+      : rawMessages;
+    const list: Array<{
+      msgs: ChatMessage[];
+      withSafety: boolean;
+      label: string;
+    }> = [];
+    if (hasPrefill || hasGeminiSafety) {
+      list.push({
+        msgs: normalizeMessagesForRequest(state, msgsWithNormalizedImages, true),
+        withSafety: hasGeminiSafety,
+        label: 'chuẩn',
+      });
+    }
+    list.push({
+      msgs: normalizeMessagesForRequest(state, msgsWithNormalizedImages, false),
+      withSafety: false,
+      label: 'tương thích',
+    });
+    return list;
+  };
 
-  if (hasPrefill || hasGeminiSafety) {
-    attemptVariants.push({
-      msgs: normalizeMessagesForRequest(state, rawMessages, true),
-      withSafety: hasGeminiSafety,
-      label: 'chuẩn',
+  // Build execution modes:
+  // Always honor streamEnabled first; if this turn has attached images and streaming fails/hangs/returns empty,
+  // automatically fall back to non-stream (stream: false) so multimodal proxies that choke on SSE still succeed.
+  const modeQueue: Array<{ useStream: boolean; modeLabel: string }> = [
+    {
+      useStream: Boolean(state.streamEnabled),
+      modeLabel: state.streamEnabled ? 'stream' : 'non-stream',
+    },
+  ];
+  if (hasAttachedImages && state.streamEnabled) {
+    modeQueue.push({
+      useStream: false,
+      modeLabel: 'non-stream dự phòng',
     });
   }
-  attemptVariants.push({
-    msgs: normalizeMessagesForRequest(state, rawMessages, false),
-    withSafety: false,
-    label: 'tương thích',
-  });
+
+  const requestConnectTimeoutMs = hasAttachedImages ? 135_000 : 180_000;
+  const streamIdleTimeoutMs = hasAttachedImages ? 85_000 : 110_000;
 
   let lastErr = '';
-  for (const url of endpoints) {
-    for (const variant of attemptVariants) {
-      try {
-        const headers: Record<string, string> = {
-          'Content-Type': 'application/json',
-          Accept: 'application/json, text/event-stream',
-        };
-        if (apiKey) {
-          headers['Authorization'] = `Bearer ${apiKey}`;
-          if (isGemini) {
-            headers['x-goog-api-key'] = apiKey;
-          }
+  let sawHttp413 = false;
+
+  for (const mode of modeQueue) {
+    const endpoints = buildEndpointCandidates(
+      baseUrl,
+      model,
+      mode.useStream,
+      isGemini,
+    );
+
+    if (mode.modeLabel === 'non-stream dự phòng') {
+      onLog(
+        `[Ảnh đính kèm] Luồng stream không trả về nội dung ổn định — tự động chuyển sang chế độ non-stream dự phòng...`,
+      );
+    }
+
+    for (const url of endpoints) {
+      let attemptVariants = buildAttemptVariants(activeImageUrls);
+      let variantIdx = 0;
+
+      while (variantIdx < attemptVariants.length) {
+        if (signal.aborted) {
+          return { ok: false, text: '', statusLabel: 'Đã dừng', aborted: true };
         }
+        const variant = attemptVariants[variantIdx];
+        const timed = createTimedAbortSignal(signal, requestConnectTimeoutMs);
 
-        const messages = variant.msgs;
-        const sysPrompts = messages
-          .filter((m) => m.role === 'system')
-          .map((m) => (typeof m.content === 'string' ? m.content : ''))
-          .filter(Boolean);
-        const nonSys = messages.filter((m) => m.role !== 'system');
-        const targetMaxTokens = 65536;
+        try {
+          const headers: Record<string, string> = {
+            'Content-Type': 'application/json',
+            Accept: mode.useStream
+              ? 'application/json, text/event-stream'
+              : 'application/json',
+          };
+          if (apiKey) {
+            headers['Authorization'] = `Bearer ${apiKey}`;
+            if (isGemini) {
+              headers['x-goog-api-key'] = apiKey;
+            }
+          }
 
-        const body = isGemini
-          ? {
-              ...(sysPrompts.length
-                ? { systemInstruction: { parts: [{ text: sysPrompts.join('\n\n') }] } }
-                : {}),
-              contents: nonSys.map((m) => ({
-                role: m.role === 'assistant' ? 'model' : 'user',
-                parts: Array.isArray(m.content)
-                  ? m.content.map((c) =>
-                      c.type === 'image_url'
-                        ? (() => {
-                            const rawUrl = c.image_url.url || '';
-                            const mimeMatch = /^data:(image\/[a-zA-Z0-9.+-]+);base64,/i.exec(rawUrl);
+          const messages = variant.msgs;
+          const sysPrompts = messages
+            .filter((m) => m.role === 'system')
+            .map((m) => (typeof m.content === 'string' ? m.content : ''))
+            .filter(Boolean);
+          const nonSys = messages.filter((m) => m.role !== 'system');
+          const targetMaxTokens = 65536;
+
+          const body = isGemini
+            ? {
+                ...(sysPrompts.length
+                  ? {
+                      systemInstruction: {
+                        parts: [{ text: sysPrompts.join('\n\n') }],
+                      },
+                    }
+                  : {}),
+                contents: nonSys.map((m) => ({
+                  role: m.role === 'assistant' ? 'model' : 'user',
+                  parts: Array.isArray(m.content)
+                    ? m.content
+                        .map((c) => {
+                          if (c.type === 'image_url') {
+                            const rawUrl = (c.image_url?.url || '').trim();
+                            const mimeMatch =
+                              /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/s.exec(
+                                rawUrl,
+                              );
+                            if (!mimeMatch || !mimeMatch[2]) return null;
                             return {
                               inlineData: {
-                                mimeType: mimeMatch ? mimeMatch[1] : 'image/jpeg',
-                                data: rawUrl.split(',')[1] || '',
+                                mimeType: mimeMatch[1].toLowerCase(),
+                                data: mimeMatch[2].replace(/\s+/g, ''),
                               },
                             };
-                          })()
-                        : { text: c.text || '' },
-                    )
-                  : [
-                      {
-                        text:
-                          typeof m.content === 'string'
-                            ? m.content
-                            : JSON.stringify(m.content),
-                      },
-                    ],
-              })),
-              generationConfig: { maxOutputTokens: targetMaxTokens },
-              ...(variant.withSafety
-                ? { safetySettings: state.config.safetySettings || DEFAULT_SAFETY }
-                : {}),
+                          }
+                          return { text: c.text || '' };
+                        })
+                        .filter((p): p is NonNullable<typeof p> => Boolean(p))
+                    : [
+                        {
+                          text:
+                            typeof m.content === 'string'
+                              ? m.content
+                              : JSON.stringify(m.content),
+                        },
+                      ],
+                })),
+                generationConfig: { maxOutputTokens: targetMaxTokens },
+                ...(variant.withSafety
+                  ? {
+                      safetySettings:
+                        state.config.safetySettings || DEFAULT_SAFETY,
+                    }
+                  : {}),
+              }
+            : {
+                model,
+                messages,
+                max_tokens: targetMaxTokens,
+                stream: Boolean(mode.useStream),
+                ...(variant.withSafety && /gemini/i.test(model)
+                  ? {
+                      safetySettings:
+                        state.config.safetySettings || DEFAULT_SAFETY,
+                    }
+                  : {}),
+              };
+
+          const res = await fetchProxyTarget({
+            url,
+            method: 'POST',
+            headers,
+            body,
+            signal: timed.signal,
+            useServerProxy: shouldUseServerProxy(state.config),
+          });
+
+          // Clear connect timer once response headers arrive (stream idle timer takes over below)
+          timed.cleanup();
+
+          if (!res.ok) {
+            const errTxt = await res.text().catch(() => '');
+            lastErr = `HTTP ${res.status} [${variant.label} · ${mode.modeLabel}] tại ${url}${
+              errTxt ? `: ${errTxt.slice(0, 320)}` : ''
+            }`;
+            onLog(lastErr);
+
+            // Auto re-compress once on HTTP 413 / payload-too-large errors for image-bearing turns
+            if (
+              hasAttachedImages &&
+              !compactRetryApplied &&
+              isPayloadTooLargeFailure(res.status, errTxt)
+            ) {
+              sawHttp413 = true;
+              compactRetryApplied = true;
+              onLog(
+                '[Ảnh đính kèm] Máy chủ báo gói ảnh quá lớn (HTTP 413) — tự động nén gọn xuống ≤1024px và thử lại...',
+              );
+              const rePrepped = await normalizeTurnImages({
+                compactRetry: true,
+              });
+              if (rePrepped.ok && rePrepped.urls.length > 0) {
+                activeImageUrls = rePrepped.urls;
+                attemptVariants = buildAttemptVariants(activeImageUrls);
+                // Retry the same variant index with smaller images
+                continue;
+              }
             }
-          : {
-              model,
-              messages,
-              max_tokens: targetMaxTokens,
-              stream: Boolean(state.streamEnabled),
-              ...(variant.withSafety && /gemini/i.test(model)
-                ? { safetySettings: state.config.safetySettings || DEFAULT_SAFETY }
-                : {}),
+
+            variantIdx += 1;
+            continue;
+          }
+
+          const respContentType = (
+            res.headers.get('content-type') || ''
+          ).toLowerCase();
+          const canReadAsStream =
+            mode.useStream &&
+            res.body &&
+            typeof res.body.getReader === 'function' &&
+            !respContentType.includes('application/json');
+
+          if (canReadAsStream && res.body) {
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let rawEntireStream = '';
+            let reasoningAcc = '';
+            let contentAcc = '';
+
+            const composeStreamedRaw = () => {
+              if (reasoningAcc.trim()) {
+                if (contentAcc) {
+                  return `<thinking>\n${reasoningAcc.trim()}\n</thinking>\n\n${contentAcc}`;
+                }
+                return `<thinking>\n${reasoningAcc}`;
+              }
+              return contentAcc;
             };
 
-        const res = await fetchProxyTarget({
-          url,
-          method: 'POST',
-          headers,
-          body,
-          signal,
-          useServerProxy: shouldUseServerProxy(state.config),
-        });
-
-        if (!res.ok) {
-          const errTxt = await res.text().catch(() => '');
-          lastErr = `HTTP ${res.status} [${variant.label}] tại ${url}${
-            errTxt ? `: ${errTxt.slice(0, 320)}` : ''
-          }`;
-          onLog(lastErr);
-          continue;
-        }
-
-        if (state.streamEnabled && res.body && typeof res.body.getReader === 'function') {
-          const reader = res.body.getReader();
-          const decoder = new TextDecoder();
-          let buffer = '';
-          let reasoningAcc = '';
-          let contentAcc = '';
-
-          const composeStreamedRaw = () => {
-            if (reasoningAcc.trim()) {
-              if (contentAcc) {
-                return `<thinking>\n${reasoningAcc.trim()}\n</thinking>\n\n${contentAcc}`;
+            const processSseLine = (rawLine: string) => {
+              const trimmed = rawLine.trim();
+              if (!trimmed || trimmed === 'data: [DONE]' || trimmed === '[DONE]') {
+                return;
               }
-              return `<thinking>\n${reasoningAcc}`;
-            }
-            return contentAcc;
-          };
-
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || '';
-
-            for (const line of lines) {
-              const trimmed = line.trim();
-              if (!trimmed || trimmed === 'data: [DONE]') continue;
+              if (trimmed.startsWith(':')) return; // SSE comment / keepalive
               const payloadStr = trimmed.startsWith('data:')
                 ? trimmed.slice(5).trim()
                 : trimmed;
+              if (!payloadStr || payloadStr === '[DONE]') return;
               try {
-                const json = JSON.parse(payloadStr);
-                const delta = json?.choices?.[0]?.delta;
-                let contentPiece = '';
-                let reasoningPiece = '';
-
-                if (delta && typeof delta === 'object') {
-                  if (typeof delta.content === 'string') {
-                    contentPiece = delta.content;
-                  }
-                  const rawReasoning =
-                    delta.reasoning_content ?? delta.reasoning ?? delta.thought;
-                  if (typeof rawReasoning === 'string') {
-                    reasoningPiece = rawReasoning;
-                  }
-                } else if (Array.isArray(json?.candidates?.[0]?.content?.parts)) {
-                  for (const part of json.candidates[0].content.parts as Array<{
-                    text?: string;
-                    thought?: boolean;
-                  }>) {
-                    if (typeof part?.text !== 'string' || !part.text) continue;
-                    if (part.thought) {
-                      reasoningPiece += part.text;
-                    } else {
-                      contentPiece += part.text;
-                    }
-                  }
-                } else {
-                  const fallback =
-                    json?.delta ?? json?.content ?? json?.text ?? '';
-                  if (typeof fallback === 'string') {
-                    contentPiece = fallback;
-                  }
-                }
-
+                const json = JSON.parse(payloadStr) as Record<string, unknown>;
+                const { contentPiece, reasoningPiece } =
+                  extractPiecesFromModelPayload(json);
                 if (reasoningPiece) {
                   reasoningAcc += reasoningPiece;
                 }
@@ -1996,94 +2345,186 @@ export async function executeModelTurn(options: {
                   onChunk(composeStreamedRaw());
                 }
               } catch {
-                if (!trimmed.startsWith('{')) {
+                // Ignore incomplete JSON fragments; non-JSON plain text lines only if not starting with '{' or '['
+                if (
+                  !payloadStr.startsWith('{') &&
+                  !payloadStr.startsWith('[') &&
+                  !trimmed.startsWith('event:') &&
+                  !trimmed.startsWith('id:') &&
+                  !trimmed.startsWith('retry:')
+                ) {
                   contentAcc += payloadStr;
                   onChunk(composeStreamedRaw());
                 }
               }
-            }
-          }
-          const rawCombined = composeStreamedRaw();
-          if (!rawCombined.trim()) {
-            lastErr = `Stream hoàn tất nhưng không có nội dung văn bản từ ${url}`;
-            continue;
-          }
-          const cleanedStory = sanitizeCompletedStoryResponse(
-            contentAcc.trim() ? contentAcc : rawCombined,
-          );
-          return {
-            ok: true,
-            text: cleanedStory,
-            rawText: rawCombined,
-            statusLabel: 'Hoàn tất',
-          };
-        } else {
-          const data = await res.json();
-          let reasoningOut = '';
-          let contentOut = '';
+            };
 
-          const msgObj = data?.choices?.[0]?.message;
-          if (msgObj && typeof msgObj === 'object') {
-            if (typeof msgObj.content === 'string') {
-              contentOut = msgObj.content;
-            }
-            const rawReasoning =
-              msgObj.reasoning_content ?? msgObj.reasoning ?? msgObj.thought;
-            if (typeof rawReasoning === 'string') {
-              reasoningOut = rawReasoning;
-            }
-          } else if (Array.isArray(data?.candidates?.[0]?.content?.parts)) {
-            for (const part of data.candidates[0].content.parts as Array<{
-              text?: string;
-              thought?: boolean;
-            }>) {
-              if (typeof part?.text !== 'string' || !part.text) continue;
-              if (part.thought) {
-                reasoningOut += part.text;
-              } else {
-                contentOut += part.text;
+            try {
+              while (true) {
+                const { done, value } = await readChunkWithIdleTimeout(
+                  reader,
+                  streamIdleTimeoutMs,
+                  signal,
+                );
+                if (done) break;
+                const decoded = decoder.decode(value, { stream: true });
+                rawEntireStream += decoded;
+                buffer += decoded;
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+                for (const line of lines) {
+                  processSseLine(line);
+                }
+              }
+              // Flush any final UTF-8 bytes & remaining tail line without trailing newline
+              const finalDecoded = decoder.decode();
+              if (finalDecoded) {
+                rawEntireStream += finalDecoded;
+                buffer += finalDecoded;
+              }
+              if (buffer.trim()) {
+                for (const tailLine of buffer.split('\n')) {
+                  processSseLine(tailLine);
+                }
+              }
+            } catch (streamErr) {
+              await reader.cancel().catch(() => {});
+              throw streamErr;
+            } finally {
+              try {
+                reader.releaseLock();
+              } catch {
+                // ignore
               }
             }
+
+            // Fallback: some proxies ignore `stream: true` on vision requests and send a single multi-line JSON body
+            if (!contentAcc.trim() && !reasoningAcc.trim() && rawEntireStream.trim()) {
+              try {
+                const wholeJson = JSON.parse(rawEntireStream.trim()) as Record<
+                  string,
+                  unknown
+                >;
+                const parsed = extractPiecesFromModelPayload(wholeJson);
+                if (parsed.reasoningPiece) reasoningAcc += parsed.reasoningPiece;
+                if (parsed.contentPiece) contentAcc += parsed.contentPiece;
+                if (parsed.contentPiece || parsed.reasoningPiece) {
+                  onChunk(composeStreamedRaw());
+                }
+              } catch {
+                // Not single JSON object
+              }
+            }
+
+            const rawCombined = composeStreamedRaw();
+            if (!rawCombined.trim()) {
+              lastErr = `Stream [${variant.label}] hoàn tất nhưng không có nội dung văn bản từ ${url}`;
+              onLog(lastErr);
+              variantIdx += 1;
+              continue;
+            }
+            const cleanedStory = sanitizeCompletedStoryResponse(
+              contentAcc.trim() ? contentAcc : rawCombined,
+            );
+            return {
+              ok: true,
+              text: cleanedStory,
+              rawText: rawCombined,
+              statusLabel: 'Hoàn tất',
+            };
           } else {
-            const fallback = data?.content ?? data?.text ?? '';
-            contentOut =
-              typeof fallback === 'string' ? fallback : JSON.stringify(fallback);
-          }
+            const rawBodyText = await res.text();
+            let reasoningOut = '';
+            let contentOut = '';
 
-          const rawCombined = reasoningOut.trim()
-            ? contentOut.trim()
-              ? `<thinking>\n${reasoningOut.trim()}\n</thinking>\n\n${contentOut}`
-              : `<thinking>\n${reasoningOut.trim()}\n</thinking>`
-            : contentOut;
+            if (rawBodyText.trim()) {
+              try {
+                const data = JSON.parse(rawBodyText) as Record<string, unknown>;
+                const parsed = extractPiecesFromModelPayload(data);
+                contentOut = parsed.contentPiece;
+                reasoningOut = parsed.reasoningPiece;
+              } catch {
+                // Some proxies still return SSE lines even when stream: false
+                for (const rawLine of rawBodyText.split('\n')) {
+                  const trimmed = rawLine.trim();
+                  if (!trimmed || trimmed === 'data: [DONE]' || trimmed.startsWith(':')) {
+                    continue;
+                  }
+                  const payloadStr = trimmed.startsWith('data:')
+                    ? trimmed.slice(5).trim()
+                    : trimmed;
+                  if (!payloadStr || payloadStr === '[DONE]') continue;
+                  try {
+                    const chunkJson = JSON.parse(payloadStr) as Record<
+                      string,
+                      unknown
+                    >;
+                    const parsed = extractPiecesFromModelPayload(chunkJson);
+                    if (parsed.reasoningPiece) reasoningOut += parsed.reasoningPiece;
+                    if (parsed.contentPiece) contentOut += parsed.contentPiece;
+                  } catch {
+                    // skip unparseable SSE metadata
+                  }
+                }
+              }
+            }
 
-          if (!rawCombined.trim()) {
-            lastErr = `Phản hồi rỗng từ ${url}`;
-            continue;
+            const rawCombined = reasoningOut.trim()
+              ? contentOut.trim()
+                ? `<thinking>\n${reasoningOut.trim()}\n</thinking>\n\n${contentOut}`
+                : `<thinking>\n${reasoningOut.trim()}\n</thinking>`
+              : contentOut;
+
+            if (!rawCombined.trim()) {
+              lastErr = `Phản hồi rỗng [${variant.label} · ${mode.modeLabel}] từ ${url}`;
+              onLog(lastErr);
+              variantIdx += 1;
+              continue;
+            }
+            const cleanedStory = sanitizeCompletedStoryResponse(
+              contentOut.trim() ? contentOut : rawCombined,
+            );
+            return {
+              ok: true,
+              text: cleanedStory,
+              rawText: rawCombined,
+              statusLabel:
+                mode.modeLabel === 'non-stream dự phòng'
+                  ? 'Hoàn tất (dự phòng)'
+                  : 'Hoàn tất',
+            };
           }
-          const cleanedStory = sanitizeCompletedStoryResponse(
-            contentOut.trim() ? contentOut : rawCombined,
-          );
-          return {
-            ok: true,
-            text: cleanedStory,
-            rawText: rawCombined,
-            statusLabel: 'Hoàn tất',
-          };
+        } catch (err) {
+          timed.cleanup();
+          if (signal.aborted) {
+            return { ok: false, text: '', statusLabel: 'Đã dừng', aborted: true };
+          }
+          if (err instanceof StreamIdleTimeoutError) {
+            lastErr = `${err.message} [${mode.modeLabel}] (${url})`;
+            onLog(`Timeout stream: ${lastErr}`);
+          } else if (err instanceof Error && err.name === 'AbortError') {
+            lastErr = `Quá thời gian chờ phản hồi (${Math.round(requestConnectTimeoutMs / 1000)}s) [${mode.modeLabel}] (${url})`;
+            onLog(`Timeout: ${lastErr}`);
+          } else {
+            lastErr = `${err instanceof Error ? err.message : String(err)} [${mode.modeLabel}] (${url})`;
+            onLog(`Lỗi: ${lastErr}`);
+          }
+          variantIdx += 1;
         }
-      } catch (err) {
-        if (err instanceof Error && err.name === 'AbortError') {
-          return { ok: false, text: '', statusLabel: 'Đã dừng', aborted: true };
-        }
-        lastErr = `${err instanceof Error ? err.message : String(err)} (${url})`;
-        onLog(`Lỗi: ${lastErr}`);
       }
     }
   }
 
+  const visionHintNote = hasAttachedImages
+    ? sawHttp413
+      ? '\n\nGợi ý: Gói ảnh vẫn vượt giới hạn của Proxy/Model đích. Hãy hạ "Độ phân giải resize ảnh" xuống 1024px hoặc gửi từng ảnh một.'
+      : '\n\nGợi ý: Nếu proxy hoặc model hiện tại chưa hỗ trợ đầu vào hình ảnh (Vision) hoặc mạng chậm làm rớt kết nối, hãy kiểm tra Model hỗ trợ Vision, hạ độ phân giải nén ảnh (1024px–1280px) hoặc bật/tắt Server Proxy (/api/proxy) trong Cấu hình.'
+    : '';
+
   return {
     ok: false,
-    text: `[Không thể gọi AI] ${lastErr || 'Không kết nối được proxy.'}`,
-    statusLabel: 'Lỗi gọi AI',
+    text: `[Không thể gọi AI] ${lastErr || 'Không kết nối được proxy.'}${visionHintNote}`,
+    statusLabel: hasAttachedImages ? 'Lỗi gửi ảnh tới AI' : 'Lỗi gọi AI',
   };
 }
 
@@ -2532,7 +2973,7 @@ export async function runAiMemorySync(options: {
     return { ok: false, error: 'Trang truyện hiện tại chưa có nội dung diễn biến.' };
   }
 
-  const activeComp = getActiveCompanionFromState(state);
+  const activeComp = getStoryBoundCompanionFromState(state);
   const rawMcName = (
     activeComp?.mc?.name ||
     state.player?.name ||
@@ -7144,7 +7585,7 @@ export function extractPresentCharactersFromScene(
 
   const found: Array<{ name: string; pos: number; priority: number }> = [];
 
-  const activeComp = getActiveCompanionFromState(state);
+  const activeComp = getStoryBoundCompanionFromState(state);
   const allowedKnownKeys = buildAllowedRosterKeys(activeComp, state.player?.name);
   const cultivationBlockedKeys = buildCultivationNonNpcKeys(
     state.memory?.cultivation,
@@ -7174,12 +7615,20 @@ export function extractPresentCharactersFromScene(
   const knownNames = [
     ...(activeComp?.npcs || []).map((n) => n.name),
     ...(activeComp?.canonCandidates || []).map((c) => c.name),
+    ...(state.portraitBank?.portraits || [])
+      .filter(
+        (p) =>
+          p.isMc ||
+          !isInvalidNpcPortrait(p, allowedKnownKeys, cultivationBlockedKeys),
+      )
+      .map((p) => p.name),
     activeComp?.mc?.name || '',
     activeComp?.mc?.canonMcName || '',
     state.player?.name || '',
   ]
     .map((s) => String(s || '').trim())
-    .filter((s) => s.length >= 2);
+    .filter((s) => s.length >= 2 && !isShortCodeOrBracketedJunkName(s))
+    .sort((a, b) => b.split(/\s+/).length - a.split(/\s+/).length);
 
   const registerName = (
     rawName: string,
@@ -7188,7 +7637,7 @@ export function extractPresentCharactersFromScene(
     skipPresenceCheck = false,
   ) => {
     const rawTrim = String(rawName || '').trim();
-    if (!rawTrim) return;
+    if (!rawTrim || isShortCodeOrBracketedJunkName(rawTrim)) return;
     const rawKey = normalizeNameKey(rawTrim);
     if (!rawKey) return;
 
@@ -7213,6 +7662,7 @@ export function extractPresentCharactersFromScene(
     }
 
     if (
+      isShortCodeOrBracketedJunkName(resolvedCandidate) ||
       isNonPersonCultivationOrWorldTerm(
         resolvedCandidate,
         cultivationBlockedKeys,
@@ -8976,7 +9426,7 @@ function resolveImageCharacterIdentity(
   matchedDisplay?: string,
 ): ResolvedImageCharacterIdentity {
   const cleanRaw = String(rawName || '').trim();
-  const activeComp = getActiveCompanionFromState(state);
+  const activeComp = getStoryBoundCompanionFromState(state);
   const portraits = Array.isArray(state.portraitBank?.portraits)
     ? state.portraitBank.portraits
     : [];
@@ -9159,7 +9609,7 @@ export function detectSecondaryCharactersInSceneText(
   ).trim();
   if (!cleanText) return { resolved: [], unresolved: [] };
 
-  const activeComp = getActiveCompanionFromState(state);
+  const activeComp = getStoryBoundCompanionFromState(state);
   const allowedKnownKeys = buildAllowedRosterKeys(activeComp, state.player?.name);
   const portraits = (state.portraitBank?.portraits || []).filter(
     (p) => !isInvalidNpcPortrait(p, allowedKnownKeys),
@@ -9927,7 +10377,7 @@ export function buildStoryImagePromptContext(options: {
     aiBeatPrompt,
   } = options;
   const storyImageConfig = (rawStoryImageConfig || {}) as StoryImageConfig;
-  const activeComp = getActiveCompanionFromState(state);
+  const activeComp = getStoryBoundCompanionFromState(state);
   const npcs = Array.isArray(activeComp?.npcs) ? activeComp.npcs : [];
   const portraits = Array.isArray(state?.portraitBank?.portraits)
     ? state.portraitBank.portraits
@@ -10880,7 +11330,7 @@ export function buildStrictVisualPromptCompilerSystemPrompt(options: {
 }
 
 export function isWuxiaOrXianxiaWorldState(state?: ArkState): boolean {
-  const activeComp = state ? getActiveCompanionFromState(state) : undefined;
+  const activeComp = state ? getStoryBoundCompanionFromState(state) : undefined;
   const activeMemory =
     (activeComp?.id && state?.companionMemories?.[activeComp.id]) ||
     state?.memory;
@@ -10908,7 +11358,7 @@ export function isWuxiaOrXianxiaWorldState(state?: ArkState): boolean {
 }
 
 export function isXianxiaWorldState(state?: ArkState): boolean {
-  const activeComp = state ? getActiveCompanionFromState(state) : undefined;
+  const activeComp = state ? getStoryBoundCompanionFromState(state) : undefined;
   const activeMemory =
     (activeComp?.id && state?.companionMemories?.[activeComp.id]) ||
     state?.memory;
@@ -11047,7 +11497,7 @@ export function resolveCharacterEquippedGearForVisualPrompt(
     combinedCleanEn: '',
   };
   if (!state) return empty;
-  const activeComp = getActiveCompanionFromState(state);
+  const activeComp = getStoryBoundCompanionFromState(state);
   const mcKeys = new Set(
     [state.player?.name, activeComp?.mc?.name]
       .map((n) => normalizeCharacterKey(n || ''))
@@ -12568,7 +13018,7 @@ export function detectCharactersInTurnForPortraits(
   const combinedClean = [cleanAssistant, cleanUser].filter(Boolean).join('\n');
   if (!combinedClean.trim()) return [];
 
-  const activeComp = getActiveCompanionFromState(state);
+  const activeComp = getStoryBoundCompanionFromState(state);
   const allowedKnownKeys = buildAllowedRosterKeys(activeComp, state.player?.name);
   const cultivationBlockedKeys = buildCultivationNonNpcKeys(
     state.memory?.cultivation,
@@ -12617,16 +13067,21 @@ export function detectCharactersInTurnForPortraits(
         ...npcs.map((n) => n.name),
         ...existingPortraits.map((p) => p.name),
         ...findKnownCelebritiesInText(sceneOnlyProse).map((c) => c.displayName),
-      ].filter(Boolean),
+      ].filter(
+        (n) =>
+          Boolean(n) &&
+          !isShortCodeOrBracketedJunkName(n) &&
+          !isNonPersonCultivationOrWorldTerm(n, cultivationBlockedKeys),
+      ),
     ),
-  );
+  ).sort((a, b) => b.split(/\s+/).length - a.split(/\s+/).length);
 
   const orderedNames: string[] = [];
   const seenIdentityKeys = new Set<string>();
 
   const pushName = (rawName: string) => {
     const rawTrim = String(rawName || '').trim();
-    if (!rawTrim) return;
+    if (!rawTrim || isShortCodeOrBracketedJunkName(rawTrim)) return;
     const rawKey = normalizeCharacterKey(rawTrim);
     if (!rawKey) return;
 
@@ -12648,6 +13103,7 @@ export function detectCharactersInTurnForPortraits(
     }
 
     if (
+      isShortCodeOrBracketedJunkName(resolvedInput) ||
       isNonPersonCultivationOrWorldTerm(resolvedInput, cultivationBlockedKeys)
     ) {
       return;
@@ -12668,8 +13124,8 @@ export function detectCharactersInTurnForPortraits(
     if (isCharacterExplicitlyAbsent(sceneOnlyProse, cleaned, false)) return;
 
     const idObj = collectCharacterIdentityKeys(cleaned);
-    for (const ak of idObj.aliasKeys) {
-      if (seenIdentityKeys.has(ak)) return;
+    if (areIdentityKeysShadowMatch(seenIdentityKeys, idObj.aliasKeys)) {
+      return;
     }
     for (const ak of idObj.aliasKeys) {
       seenIdentityKeys.add(ak);
@@ -12987,7 +13443,7 @@ export function buildCharacterPortraitPrompt(options: {
     state?.storyImage?.stylePreset,
     state?.storyImage?.customStyles,
   );
-  const activeComp = state ? getActiveCompanionFromState(state) : undefined;
+  const activeComp = state ? getStoryBoundCompanionFromState(state) : undefined;
   const worldGenreHint = [
     state?.world?.genre,
     state?.world?.name,
@@ -14627,7 +15083,7 @@ export async function enrichVividNpcProfilesWithAi(options: {
     };
   }
 
-  const activeComp = getActiveCompanionFromState(state);
+  const activeComp = getStoryBoundCompanionFromState(state);
   const allowedRosterForEnrich = buildAllowedRosterKeys(
     activeComp,
     state.player?.name,
@@ -17472,7 +17928,7 @@ export async function generateTurnSuggestionsWithAi(options: {
     ? stripStoryPlanningAndMeta(prevTurn.assistant || '')
     : '';
 
-  const activeComp = getActiveCompanionFromState(state);
+  const activeComp = getStoryBoundCompanionFromState(state);
   const rawMcName = (
     activeComp?.mc?.name ||
     state.player?.name ||
@@ -18258,7 +18714,7 @@ function buildRankingWorldBrief(state: ArkState): {
   clockSummary: string;
   recentProse: string;
 } {
-  const activeComp = getActiveCompanionFromState(state);
+  const activeComp = getStoryBoundCompanionFromState(state);
   const mcName = (
     activeComp?.mc?.name ||
     state.player?.name ||
@@ -18711,7 +19167,7 @@ export async function recalculateCultivationRankingsWithAi(params: {
   }
 
   const brief = buildRankingWorldBrief(state);
-  const activeComp = getActiveCompanionFromState(state);
+  const activeComp = getStoryBoundCompanionFromState(state);
   const mcName = (
     activeComp?.mc?.name ||
     state.player?.name ||

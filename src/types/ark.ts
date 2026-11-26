@@ -166,7 +166,8 @@ export type AiTaskSlotId =
   | 'suggestions'
   | 'referenceCheck'
   | 'fanfic'
-  | 'utility';
+  | 'utility'
+  | 'showbizPhone';
 
 export interface AiTaskModelSlots {
   /** Model riêng cho nút AI gợi ý lượt đi */
@@ -177,6 +178,90 @@ export interface AiTaskModelSlots {
   fanfic?: string;
   /** Model riêng cho các tác vụ AI phụ khác (Trí nhớ/Tóm tắt, Hồ sơ NPC, Dựng thế giới) */
   utility?: string;
+  /** Model riêng cho tính năng Điện thoại Showbiz (DM, Chat nhóm, MXH) */
+  showbizPhone?: string;
+}
+
+export interface ShowbizPhoneApiConfig {
+  /** URL endpoint riêng cho Điện thoại Showbiz; để trống sẽ tự dùng proxyUrl chung */
+  proxyUrl?: string;
+  /** API key riêng cho Điện thoại Showbiz; để trống sẽ tự dùng proxyKey chung */
+  proxyKey?: string;
+  /** Model riêng cho Điện thoại Showbiz; để trống sẽ tự dùng taskModels.showbizPhone hoặc model chung */
+  model?: string;
+  /** Giao thức API riêng ('openai' | 'auto' | 'gemini'); để trống sẽ tự dùng apiProtocol chung */
+  apiProtocol?: ApiProtocol | '';
+  /** Đi qua /api/proxy của server để tránh lỗi CORS (mặc định dùng theo cấu hình chung) */
+  useServerProxy?: boolean;
+}
+
+export interface ShowbizPhoneContact {
+  id: string;
+  name: string;
+  handle: string;
+  role?: string;
+  bio?: string;
+  avatarData?: string;
+  relation?: string;
+  source: 'save_npc' | 'manual';
+  verified?: boolean;
+  addedAt: number;
+  lastActiveAt?: number;
+}
+
+export interface ShowbizPhoneMessage {
+  id: string;
+  senderId: string; // 'mc' or contact.id
+  senderName: string;
+  text: string;
+  createdAt: number;
+  isMc?: boolean;
+}
+
+export interface ShowbizPhoneGroup {
+  id: string;
+  name: string;
+  topic?: string;
+  memberIds: string[];
+  messages: ShowbizPhoneMessage[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ShowbizPhoneComment {
+  id: string;
+  authorId: string; // 'mc' or contact.id
+  authorName: string;
+  authorHandle?: string;
+  text: string;
+  createdAt: number;
+  isMc?: boolean;
+}
+
+export interface ShowbizPhonePost {
+  id: string;
+  authorId: string; // 'mc' or contact.id
+  authorName: string;
+  authorHandle: string;
+  authorRole?: string;
+  authorAvatarData?: string;
+  isMc?: boolean;
+  content: string;
+  locationTag?: string;
+  hashtags?: string[];
+  likes: number;
+  likedByMc?: boolean;
+  comments: ShowbizPhoneComment[];
+  createdAt: number;
+  bridgedToStoryAt?: number;
+}
+
+export interface ShowbizPhoneState {
+  contacts: ShowbizPhoneContact[];
+  dmThreads: Record<string, ShowbizPhoneMessage[]>;
+  groups: ShowbizPhoneGroup[];
+  posts: ShowbizPhonePost[];
+  lastSyncedAt?: number;
 }
 
 export interface ReferenceComparisonResult {
@@ -306,6 +391,8 @@ export interface Turn {
   imageData?: string;
   imageList?: string[];
   imageCaption?: string;
+  /** Number of temporary attached user images cleared after AI reply (keeps text + caption intact to save mobile RAM). */
+  attachedImageClearedCount?: number;
   storyImageData?: string;
   storyImagePrompt?: string;
   storyImageSubject?: string;
@@ -936,6 +1023,12 @@ export interface SaveSlot {
   portraitBank?: PortraitBankConfig;
   context?: ContextConfig;
   tawaPreset?: TawaPreset;
+  /** ID Đồng hành đang gắn trực tiếp với save này (null nếu là thế giới/save độc lập) */
+  activeStoryCompanionId?: string | null;
+  /** Bản chụp hồ sơ Đồng hành tại thời điểm lưu để cô lập NPC theo từng save */
+  companionSnapshot?: CompanionProfile | null;
+  /** Dữ liệu Điện thoại Showbiz riêng của save này */
+  showbizPhone?: ShowbizPhoneState;
 }
 
 export interface Checkpoint {
@@ -947,6 +1040,9 @@ export interface Checkpoint {
   portraitBank?: PortraitBankConfig;
   context?: ContextConfig;
   activeCompanionId?: string;
+  activeStoryCompanionId?: string | null;
+  companionSnapshot?: CompanionProfile | null;
+  showbizPhone?: ShowbizPhoneState;
   tawaPreset?: TawaPreset;
 }
 
@@ -1077,6 +1173,8 @@ export interface AppConfig {
   model: string;
   /** Optional dedicated model overrides per auxiliary AI task; falls back to main `model` when empty. */
   taskModels?: AiTaskModelSlots;
+  /** Cấu hình endpoint/key/model riêng cho tính năng Điện thoại Showbiz (rơi về cấu hình chung nếu để trống). */
+  showbizPhoneConfig?: ShowbizPhoneApiConfig;
   apiProtocol: ApiProtocol;
   /** Route external Proxy API requests through /api/proxy on the backend to avoid browser CORS errors (defaults to true). */
   useServerProxy?: boolean;
@@ -1117,6 +1215,14 @@ export interface AppConfig {
   hapticFeedbackEnabled?: boolean;
   /** Tự động chèn nhịp biến cố nhẹ (Story Beats) khi người chơi trò chuyện 2–3 lượt liên tiếp chưa có sự kiện mới */
   autoStoryBeatsEnabled?: boolean;
+  /** Giới hạn dung lượng tệp ảnh đầu vào (MB) cho mục Gửi ảnh ở màn Truyện (mặc định 30 MB) */
+  chatImageMaxInputMb?: number;
+  /** Cạnh dài tối đa (px) khi tự động resize ảnh gửi trong màn Truyện (mặc định 1600, 0 = giữ nguyên) */
+  chatImageMaxDimension?: number;
+  /** Chất lượng nén JPEG (0.5–0.96) cho ảnh gửi trong màn Truyện (mặc định 0.84) */
+  chatImageQuality?: number;
+  /** Tự động xóa dữ liệu ảnh đính kèm sau khi lượt truyện nhận phản hồi xong để nhẹ máy (mặc định bật) */
+  chatImageAutoClearAfterReply?: boolean;
   safetySettings: SafetySetting[];
 }
 
@@ -1178,6 +1284,7 @@ export interface ArkState {
   storyImage: StoryImageConfig;
   memory: MemoryManagerConfig;
   portraitBank: PortraitBankConfig;
+  showbizPhone?: ShowbizPhoneState;
   player: PlayerInfo;
   world: WorldInfo;
   config: AppConfig;
@@ -1190,8 +1297,10 @@ export interface ArkState {
   companionMemories: Record<string, MemoryManagerConfig>;
   companionPortraits: Record<string, PortraitBankConfig>;
   companionContexts: Record<string, ContextConfig>;
+  companionPhones?: Record<string, ShowbizPhoneState>;
   activeCompanionId: string;
   activeStoryCompanionId?: string | null;
+  activeSlotId?: string | null;
   /** Lịch sử các gói Hành trình Anime đã dựng để chọn lại / chơi lại 1 chạm */
   animeJourneyHistory?: AnimeJourneyPack[];
   checkpoint: Checkpoint | null;
@@ -1201,6 +1310,10 @@ export interface PendingImage {
   id?: string;
   dataUrl: string;
   name: string;
+  originalBytes?: number;
+  compressedBytes?: number;
+  width?: number;
+  height?: number;
 }
 
 export interface BannerMessage {

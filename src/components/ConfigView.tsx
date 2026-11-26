@@ -45,6 +45,14 @@ import {
   type TawaPreset,
 } from '../types/ark';
 import {
+  CHAT_IMAGE_MAX_DIMENSION_OPTIONS,
+  CHAT_IMAGE_MAX_INPUT_MB_OPTIONS,
+  CHAT_IMAGE_QUALITY_OPTIONS,
+  clampChatImageMaxDimension,
+  clampChatImageMaxInputMb,
+  clampChatImageQuality,
+} from '../utils/chatImageUpload';
+import {
   AI_TASK_SLOT_META,
   AI_TASK_SLOT_ORDER,
   analyzeComfyUiWorkflowJson,
@@ -164,6 +172,17 @@ export function ConfigView({
   const [autoStoryBeatsEnabled, setAutoStoryBeatsEnabled] = useState<boolean>(
     config.autoStoryBeatsEnabled !== false,
   );
+  const [chatImageMaxInputMb, setChatImageMaxInputMb] = useState<number>(() =>
+    clampChatImageMaxInputMb(config.chatImageMaxInputMb),
+  );
+  const [chatImageMaxDimension, setChatImageMaxDimension] = useState<number>(
+    () => clampChatImageMaxDimension(config.chatImageMaxDimension),
+  );
+  const [chatImageQuality, setChatImageQuality] = useState<number>(() =>
+    clampChatImageQuality(config.chatImageQuality),
+  );
+  const [chatImageAutoClearAfterReply, setChatImageAutoClearAfterReply] =
+    useState<boolean>(config.chatImageAutoClearAfterReply !== false);
   const [proxyQuickSwitchHint, setProxyQuickSwitchHint] = useState<
     'switch_direct' | 'switch_server_proxy' | null
   >(null);
@@ -331,6 +350,14 @@ export function ConfigView({
     setUseServerProxy(shouldUseServerProxy(config));
     setHapticFeedbackEnabled(config.hapticFeedbackEnabled !== false);
     setAutoStoryBeatsEnabled(config.autoStoryBeatsEnabled !== false);
+    setChatImageMaxInputMb(clampChatImageMaxInputMb(config.chatImageMaxInputMb));
+    setChatImageMaxDimension(
+      clampChatImageMaxDimension(config.chatImageMaxDimension),
+    );
+    setChatImageQuality(clampChatImageQuality(config.chatImageQuality));
+    setChatImageAutoClearAfterReply(
+      config.chatImageAutoClearAfterReply !== false,
+    );
     setImageProvider(
       config.imageProvider === 'comfyui'
         ? 'comfyui'
@@ -451,6 +478,10 @@ export function ConfigView({
     useServerProxy?: boolean;
     hapticFeedbackEnabled?: boolean;
     autoStoryBeatsEnabled?: boolean;
+    chatImageMaxInputMb?: number;
+    chatImageMaxDimension?: number;
+    chatImageQuality?: number;
+    chatImageAutoClearAfterReply?: boolean;
     imageProvider?: ImageProvider;
     customImageUseServerProxy?: boolean;
     customImageFormatMode?: CustomImageFormatMode;
@@ -533,12 +564,25 @@ export function ConfigView({
         proxyKey: proxyKey.trim(),
         model: model.trim(),
         taskModels: cleanTaskModels,
+        showbizPhoneConfig: config.showbizPhoneConfig,
         apiProtocol,
         useServerProxy: overrides?.useServerProxy ?? useServerProxy,
         hapticFeedbackEnabled:
           overrides?.hapticFeedbackEnabled ?? hapticFeedbackEnabled,
         autoStoryBeatsEnabled:
           overrides?.autoStoryBeatsEnabled ?? autoStoryBeatsEnabled,
+        chatImageMaxInputMb: clampChatImageMaxInputMb(
+          overrides?.chatImageMaxInputMb ?? chatImageMaxInputMb,
+        ),
+        chatImageMaxDimension: clampChatImageMaxDimension(
+          overrides?.chatImageMaxDimension ?? chatImageMaxDimension,
+        ),
+        chatImageQuality: clampChatImageQuality(
+          overrides?.chatImageQuality ?? chatImageQuality,
+        ),
+        chatImageAutoClearAfterReply:
+          overrides?.chatImageAutoClearAfterReply ??
+          chatImageAutoClearAfterReply,
         imageProvider: overrides?.imageProvider ?? imageProvider,
         seedreamUrl: seedreamUrl.trim(),
         seedreamApiKey: seedreamApiKey.trim(),
@@ -1697,7 +1741,7 @@ export function ConfigView({
     }
     applySingleModelToAllTaskSlots(
       mainModel,
-      `Đã áp dụng Model chính (${mainModel}) cho cả 4 slot AI phụ.`,
+      `Đã áp dụng Model chính (${mainModel}) cho cả ${AI_TASK_SLOT_ORDER.length} slot AI phụ.`,
     );
   };
 
@@ -1708,7 +1752,7 @@ export function ConfigView({
     );
     applySingleModelToAllTaskSlots(
       flashLiteModel,
-      `Đã áp dụng Preset tiết kiệm quota (${flashLiteModel}) cho toàn bộ 4 slot AI phụ.`,
+      `Đã áp dụng Preset tiết kiệm quota (${flashLiteModel}) cho toàn bộ ${AI_TASK_SLOT_ORDER.length} slot AI phụ.`,
     );
   };
 
@@ -1719,7 +1763,7 @@ export function ConfigView({
     );
     applySingleModelToAllTaskSlots(
       highQualityModel,
-      `Đã áp dụng Preset chất lượng cao (${highQualityModel}) cho toàn bộ 4 slot AI phụ.`,
+      `Đã áp dụng Preset chất lượng cao (${highQualityModel}) cho toàn bộ ${AI_TASK_SLOT_ORDER.length} slot AI phụ.`,
     );
   };
 
@@ -2324,6 +2368,122 @@ export function ConfigView({
           </div>
         )}
 
+        <div className="mt-3 rounded-xl border border-white/[0.08] bg-[#0e1625]/75 p-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs font-semibold text-slate-100">
+                  Gửi kèm ảnh trong màn Truyện (Nén &amp; Nhẹ máy)
+                </span>
+                <span className="inline-flex items-center rounded-md bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-sky-200 ring-1 ring-inset ring-sky-400/30">
+                  ≤{chatImageMaxInputMb} MB ·{' '}
+                  {chatImageMaxDimension > 0
+                    ? `${chatImageMaxDimension}px`
+                    : 'Giữ gốc'}
+                </span>
+              </div>
+              <p className="mt-0.5 text-[11px] leading-relaxed text-slate-400">
+                Tự động chuẩn hóa &amp; nén ảnh chụp màn hình lớn trước khi gửi qua proxy/mạng di động, và tự xóa dữ liệu ảnh tạm sau khi AI phản hồi xong để nhẹ RAM.
+              </p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={chatImageAutoClearAfterReply}
+              aria-label="Tự động xóa ảnh sau khi AI trả lời"
+              onClick={() => {
+                const next = !chatImageAutoClearAfterReply;
+                setChatImageAutoClearAfterReply(next);
+                onSaveConfig(
+                  buildCurrentPayload({ chatImageAutoClearAfterReply: next }),
+                );
+              }}
+              className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-sky-400/40 ${
+                chatImageAutoClearAfterReply
+                  ? 'bg-sky-500 ring-1 ring-inset ring-sky-300/40'
+                  : 'bg-slate-700/90 ring-1 ring-inset ring-white/[0.12]'
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                  chatImageAutoClearAfterReply ? 'translate-x-6' : 'translate-x-1'
+                }`}
+              />
+            </button>
+          </div>
+          <div className="mt-2 text-[11px] font-medium text-sky-200/85">
+            {chatImageAutoClearAfterReply
+              ? 'Đang bật: Tự xóa dữ liệu ảnh đính kèm sau khi AI phản hồi xong (giữ nguyên chữ & chú thích).'
+              : 'Đang tắt: Giữ lại ảnh đính kèm trên lượt truyện (vẫn có nút Xóa ảnh tạm thủ công).'}
+          </div>
+          <div className="mt-2.5 grid grid-cols-1 gap-2 sm:grid-cols-3">
+            <label className="block">
+              <span className="mb-1 block text-[11px] font-medium text-slate-400">
+                Giới hạn tệp đầu vào
+              </span>
+              <select
+                value={chatImageMaxInputMb}
+                onChange={(e) => {
+                  const val = clampChatImageMaxInputMb(Number(e.target.value));
+                  setChatImageMaxInputMb(val);
+                  onSaveConfig(
+                    buildCurrentPayload({ chatImageMaxInputMb: val }),
+                  );
+                }}
+                className="w-full rounded-lg border border-white/[0.10] bg-[#0b1322] px-2.5 py-2 text-xs text-slate-100 focus:border-sky-400/70 focus:outline-none"
+              >
+                {CHAT_IMAGE_MAX_INPUT_MB_OPTIONS.map((mb) => (
+                  <option key={mb} value={mb}>
+                    Tối đa {mb} MB / ảnh
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-[11px] font-medium text-slate-400">
+                Resize tự động trước khi gửi
+              </span>
+              <select
+                value={chatImageMaxDimension}
+                onChange={(e) => {
+                  const val = clampChatImageMaxDimension(Number(e.target.value));
+                  setChatImageMaxDimension(val);
+                  onSaveConfig(
+                    buildCurrentPayload({ chatImageMaxDimension: val }),
+                  );
+                }}
+                className="w-full rounded-lg border border-white/[0.10] bg-[#0b1322] px-2.5 py-2 text-xs text-slate-100 focus:border-sky-400/70 focus:outline-none"
+              >
+                {CHAT_IMAGE_MAX_DIMENSION_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-[11px] font-medium text-slate-400">
+                Chất lượng nén JPEG
+              </span>
+              <select
+                value={chatImageQuality}
+                onChange={(e) => {
+                  const val = clampChatImageQuality(Number(e.target.value));
+                  setChatImageQuality(val);
+                  onSaveConfig(buildCurrentPayload({ chatImageQuality: val }));
+                }}
+                className="w-full rounded-lg border border-white/[0.10] bg-[#0b1322] px-2.5 py-2 text-xs text-slate-100 focus:border-sky-400/70 focus:outline-none"
+              >
+                {CHAT_IMAGE_QUALITY_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+        </div>
+
         <div className="mt-3.5 max-h-44 overflow-y-auto rounded-xl border border-white/[0.07] bg-[#0c1422]/90 p-3 font-mono text-xs whitespace-pre-wrap break-words text-slate-300">
           {proxyLogs.join('\n')}
         </div>
@@ -2351,7 +2511,7 @@ export function ConfigView({
                 onClick={() =>
                   applyBulkTaskSlots(
                     {},
-                    'Đã đặt lại toàn bộ 4 slot AI phụ về mặc định theo Model chính.',
+                    `Đã đặt lại toàn bộ ${AI_TASK_SLOT_ORDER.length} slot AI phụ về mặc định theo Model chính.`,
                   )
                 }
                 className="min-h-[34px] rounded-xl bg-white/[0.055] px-3 text-xs font-semibold text-slate-300 ring-1 ring-inset ring-white/[0.08] transition-all hover:bg-white/[0.10] hover:text-white whitespace-nowrap"
@@ -2396,7 +2556,7 @@ export function ConfigView({
             <button
               type="button"
               onClick={handleApplyFlashQuotaPreset}
-              title={`Gán nhanh ${DEFAULT_QUOTA_SAVER_MODEL} cho toàn bộ 4 slot AI phụ`}
+              title={`Gán nhanh ${DEFAULT_QUOTA_SAVER_MODEL} cho toàn bộ ${AI_TASK_SLOT_ORDER.length} slot AI phụ`}
               className="inline-flex min-h-[38px] items-center justify-center gap-1.5 rounded-xl bg-emerald-500/15 px-3 py-1.5 text-xs font-semibold text-emerald-100 ring-1 ring-inset ring-emerald-400/32 transition-all hover:bg-emerald-500/25 active:scale-[0.99]"
             >
               <Zap className="h-3.5 w-3.5 shrink-0 text-emerald-300" />
@@ -2407,7 +2567,7 @@ export function ConfigView({
             <button
               type="button"
               onClick={handleApplyHighQualityPreset}
-              title={`Gán nhanh ${DEFAULT_HIGH_QUALITY_MODEL} cho toàn bộ 4 slot AI phụ`}
+              title={`Gán nhanh ${DEFAULT_HIGH_QUALITY_MODEL} cho toàn bộ ${AI_TASK_SLOT_ORDER.length} slot AI phụ`}
               className="inline-flex min-h-[38px] items-center justify-center gap-1.5 rounded-xl bg-violet-500/16 px-3 py-1.5 text-xs font-semibold text-violet-100 ring-1 ring-inset ring-violet-400/34 transition-all hover:bg-violet-500/26 active:scale-[0.99]"
             >
               <Sparkles className="h-3.5 w-3.5 shrink-0 text-violet-300" />
@@ -2433,7 +2593,7 @@ export function ConfigView({
               onClick={() =>
                 applySingleModelToAllTaskSlots(
                   'pg-gemini-3.8-flash',
-                  'Đã áp dụng nhanh mã proxy pg-gemini-3.8-flash cho toàn bộ 4 slot AI phụ.',
+                  `Đã áp dụng nhanh mã proxy pg-gemini-3.8-flash cho toàn bộ ${AI_TASK_SLOT_ORDER.length} slot AI phụ.`,
                 )
               }
               className="inline-flex min-h-[26px] items-center rounded-lg bg-white/[0.05] px-2 font-mono text-[10.5px] font-semibold text-violet-200 ring-1 ring-inset ring-violet-400/25 transition-colors hover:bg-violet-500/20 hover:text-white whitespace-nowrap"

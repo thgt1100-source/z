@@ -34,6 +34,7 @@ import { PresetView } from './components/PresetView';
 import { WorldSetupView } from './components/WorldSetupView';
 import {
   getImageProviderLabel,
+  getTurnAttachedImages,
   getTurnStoryImages,
   hasImageGeneratorConfigured,
   MAX_PENDING_CHAT_IMAGES,
@@ -57,6 +58,8 @@ import {
   type PortraitBankConfig,
   type PortraitGenProgress,
   type ReferenceComparisonResult,
+  type ShowbizPhoneApiConfig,
+  type ShowbizPhoneState,
   type StoryClockState,
   type StoryImageConfig,
   type StoryImageGenerationProgress,
@@ -140,6 +143,7 @@ import {
   createDefaultMemoryConfig,
   createDefaultModules,
   createDefaultPortraitBank,
+  createDefaultShowbizPhoneState,
   createInitialState,
   DEFAULT_PREFILL,
   DEFAULT_SAFETY,
@@ -147,6 +151,7 @@ import {
   detectStorageHealth,
   downloadImageSource,
   getActiveCompanionFromState,
+  getStoryBoundCompanionFromState,
   loadAutoSaveFromIndexedDb,
   loadBackupTrackingMeta,
   loadBackupTrackingMetaFromIndexedDb,
@@ -157,10 +162,12 @@ import {
   normalizeCompanionProfile,
   normalizeMemoryConfig,
   normalizePortraitBank,
+  normalizeShowbizPhoneState,
   normalizeTawaPreset,
   persistState,
   requestPersistentStorage,
   resolvePersistableActiveView,
+  sanitizeShowbizPhoneApiConfig,
   saveAutoSaveToIndexedDb,
   STORAGE_KEY,
   syncPortraitBankWithCompanion,
@@ -170,6 +177,11 @@ import {
   type ImageSaveFallbackPayload,
   type StorageHealthInfo,
 } from './utils/storage';
+import {
+  cleanJunkShowbizContacts,
+  getShowbizMcProfile,
+  remapShowbizPhoneContactIds,
+} from './utils/showbizPhone';
 import {
   extractPersistableSampleImages,
   mergeUserSampleImages,
@@ -200,6 +212,13 @@ import {
   storeBlobInMediaVault,
   storeDataUrlInMediaVault,
 } from './utils/mediaMemoryManager';
+import {
+  clampChatImageMaxDimension,
+  clampChatImageMaxInputMb,
+  clampChatImageQuality,
+  formatBytesCompact,
+  prepareChatImageFile,
+} from './utils/chatImageUpload';
 import {
   applyClockDeltaToCultivation,
   createStarterCultivationProfile,
@@ -326,6 +345,7 @@ export default function App() {
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   const pendingImagesRef = useRef<PendingImage[]>(pendingImages);
   pendingImagesRef.current = pendingImages;
+  const [isPreparingChatImages, setIsPreparingChatImages] = useState(false);
   const [imageCaption, setImageCaption] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
   const [genStatus, setGenStatus] = useState({ text: 'Sẵn sàng', isErr: false });
@@ -952,16 +972,45 @@ export default function App() {
             : effectiveState.world;
           const nextMemory = newestSlot.memory
             ? normalizeMemoryConfig(newestSlot.memory)
-            : effectiveState.memory;
-          const activeComp = getActiveCompanionFromState(effectiveState);
+            : createDefaultMemoryConfig({
+                enabled: effectiveState.memory?.enabled,
+                autoMemory: effectiveState.memory?.autoMemory,
+                autoStateTracker: effectiveState.memory?.autoStateTracker,
+                autoRollingSummary: effectiveState.memory?.autoRollingSummary,
+              });
+          const restoredBoundId =
+            typeof newestSlot.activeStoryCompanionId === 'string' &&
+            effectiveState.companions.some(
+              (c) => c.id === newestSlot.activeStoryCompanionId,
+            )
+              ? newestSlot.activeStoryCompanionId
+              : null;
+          const slotComp =
+            newestSlot.companionSnapshot ||
+            (restoredBoundId
+              ? effectiveState.companions.find((c) => c.id === restoredBoundId)
+              : undefined);
           const nextPortraits = newestSlot.portraitBank
-            ? normalizePortraitBank(newestSlot.portraitBank)
+            ? cleanJunkPortraitsFromBank(
+                normalizePortraitBank(newestSlot.portraitBank),
+                slotComp,
+                nextPlayer.name,
+                buildCultivationNonNpcKeys(nextMemory.cultivation),
+              ).bank
             : syncPortraitBankWithCompanion(
-                effectiveState.portraitBank,
-                activeComp,
+                createDefaultPortraitBank({
+                  autoGenerateOnAppear:
+                    effectiveState.portraitBank?.autoGenerateOnAppear,
+                  maxAutoPerTurn: effectiveState.portraitBank?.maxAutoPerTurn,
+                  includeMcAuto: effectiveState.portraitBank?.includeMcAuto,
+                }),
+                slotComp,
                 nextPlayer.name,
                 nextMemory.storyClock,
               );
+          const nextPhone = newestSlot.showbizPhone
+            ? normalizeShowbizPhoneState(newestSlot.showbizPhone)
+            : createDefaultShowbizPhoneState();
           const hydratedFromSlot: ArkState = {
             ...effectiveState,
             turns: loadedTurns,
@@ -970,17 +1019,19 @@ export default function App() {
             world: nextWorld,
             memory: nextMemory,
             portraitBank: nextPortraits,
+            showbizPhone: nextPhone,
             context: newestSlot.context
               ? { ...effectiveState.context, ...newestSlot.context }
               : effectiveState.context,
             tawaPreset: newestSlot.tawaPreset
               ? normalizeTawaPreset(newestSlot.tawaPreset, effectiveState.tawaPreset)
               : effectiveState.tawaPreset,
-            activeStoryCompanionId: null,
+            activeStoryCompanionId: restoredBoundId,
+            activeSlotId: newestSlot.id || null,
             activeView: 'chat',
           };
           effectiveState = hydratedFromSlot;
-          activeStoryCompanionIdRef.current = null;
+          activeStoryCompanionIdRef.current = restoredBoundId;
           stateRef.current = hydratedFromSlot;
           setState(hydratedFromSlot);
           setHasOpenedStory(true);
@@ -1231,7 +1282,7 @@ export default function App() {
       const nowTs = Date.now();
       const addedMems = res.memories || [];
       const updatedStates = res.states || [];
-      const activeCompForMem = getActiveCompanionFromState(working);
+      const activeCompForMem = getStoryBoundCompanionFromState(working);
       const knownNamesForMem = Array.from(
         new Set(
           [
@@ -1587,8 +1638,7 @@ export default function App() {
           ...prevBank,
           portraits: nextPortraits,
         };
-        const compKey =
-          activeStoryCompanionIdRef.current || prev.activeCompanionId || '';
+        const compKey = activeStoryCompanionIdRef.current || '';
         const nextCompPortraits = compKey
           ? { ...(prev.companionPortraits || {}), [compKey]: nextBank }
           : prev.companionPortraits || {};
@@ -1711,8 +1761,7 @@ export default function App() {
             ...prevBank,
             portraits: nextPortraits,
           };
-          const compKey =
-            activeStoryCompanionIdRef.current || prev.activeCompanionId || '';
+          const compKey = activeStoryCompanionIdRef.current || '';
           const nextCompPortraits = compKey
             ? { ...(prev.companionPortraits || {}), [compKey]: nextBank }
             : prev.companionPortraits || {};
@@ -1812,8 +1861,7 @@ export default function App() {
             ...prevBank,
             portraits: nextPortraits,
           };
-          const compKey =
-            activeStoryCompanionIdRef.current || prev.activeCompanionId || '';
+          const compKey = activeStoryCompanionIdRef.current || '';
           const nextCompPortraits = compKey
             ? { ...(prev.companionPortraits || {}), [compKey]: nextBank }
             : prev.companionPortraits || {};
@@ -2442,8 +2490,7 @@ export default function App() {
       setState((prev) => {
         const prevBank = prev.portraitBank || createDefaultPortraitBank();
         const nextBank = updater(prevBank);
-        const compKey =
-          activeStoryCompanionIdRef.current || prev.activeCompanionId || '';
+        const compKey = activeStoryCompanionIdRef.current || '';
         const nextCompPortraits = compKey
           ? { ...(prev.companionPortraits || {}), [compKey]: nextBank }
           : prev.companionPortraits || {};
@@ -2538,15 +2585,22 @@ export default function App() {
           }
         }
 
-        return {
+        const nextSnapshot: ArkState = {
           ...prev,
           companions: nextCompanions,
           portraitBank: nextBank,
           companionPortraits: nextCompPortraits,
         };
+        const didDeletePortrait =
+          (nextBank.portraits || []).length < (prevBank.portraits || []).length;
+        if (didDeletePortrait) {
+          stateRef.current = nextSnapshot;
+          flushPersistNow(nextSnapshot, 'delete_portrait');
+        }
+        return nextSnapshot;
       });
     },
-    [],
+    [flushPersistNow],
   );
 
   const collectCleanStoryExcerpt = useCallback(
@@ -2699,7 +2753,7 @@ export default function App() {
       const workingState = options?.stateOverride || stateRef.current;
       const forceManual = Boolean(options?.forceManual);
       const silent = Boolean(options?.silent);
-      const activeComp = getActiveCompanionFromState(workingState);
+      const activeComp = getStoryBoundCompanionFromState(workingState);
       const cleanStoryText = collectCleanStoryExcerpt(
         workingState,
         options?.turnIndex,
@@ -3396,34 +3450,26 @@ export default function App() {
 
   const handleCleanJunkPortraits = useCallback(() => {
     const curState = stateRef.current;
-    const activeComp = getActiveCompanionFromState(curState);
+    const activeComp = getStoryBoundCompanionFromState(curState);
+    const compKey = activeStoryCompanionIdRef.current || '';
+    const mcName = (activeComp?.mc?.name || curState.player?.name || '').trim();
     const cultivationBlockedKeys = buildCultivationNonNpcKeys(
       curState.memory?.cultivation,
     );
-    const { bank: cleanedBank, removedNames: removedPortraitNames } =
-      cleanJunkPortraitsFromBank(
-        curState.portraitBank || createDefaultPortraitBank(),
-        activeComp,
-        curState.player?.name,
-        cultivationBlockedKeys,
-      );
-    const { states: cleanedStates, removedNames: removedStateNames } =
-      cleanAndDeduplicateCharacterStates(
-        curState.memory?.characterStates || [],
-        {
-          comp: activeComp,
-          fallbackMcName: curState.player?.name,
-          knownValidNames: cleanedBank.portraits
-            .filter((p) => !isPortraitAutoScannedUnconfirmed(p))
-            .map((p) => p.name),
-          extraBlockedKeys: cultivationBlockedKeys,
-        },
-      );
 
-    // Also purge lyric/exclamation/teasing/non-person junk & duplicate variants from active Companion's NPC list
+    // 1. Purge junk/abbreviation/location/short-tail entries ONLY from the story-bound Companion (never unrelated saves)
     const removedCompNpcNames: string[] = [];
-    if (activeComp && Array.isArray(activeComp.npcs) && activeComp.npcs.length) {
-      const cleanedCompNpcs = cleanJunkCompanionNpcs(activeComp.npcs).filter(
+    let cleanedActiveComp: CompanionProfile | undefined = activeComp;
+    if (
+      activeComp &&
+      compKey &&
+      Array.isArray(activeComp.npcs) &&
+      activeComp.npcs.length
+    ) {
+      const cleanedCompNpcs = cleanJunkCompanionNpcs(activeComp.npcs, {
+        mcName,
+        extraBlockedKeys: cultivationBlockedKeys,
+      }).filter(
         (n) =>
           !isInvalidNpcPortrait(
             {
@@ -3444,14 +3490,56 @@ export default function App() {
         }
       }
       if (removedCompNpcNames.length > 0) {
-        setState((prev) => ({
-          ...prev,
-          companions: (prev.companions || []).map((c) =>
-            c.id === activeComp.id ? { ...c, npcs: cleanedCompNpcs } : c,
-          ),
-        }));
+        cleanedActiveComp = { ...activeComp, npcs: cleanedCompNpcs };
       }
     }
+
+    // 2. Clean Portrait Bank aggressively (deletes non-person, geographic, short codes, lyrics, fillers & shortened tail duplicates)
+    const { bank: cleanedBank, removedNames: removedPortraitNames } =
+      cleanJunkPortraitsFromBank(
+        curState.portraitBank || createDefaultPortraitBank(),
+        cleanedActiveComp,
+        curState.player?.name,
+        cultivationBlockedKeys,
+        { aggressiveJunkClean: true },
+      );
+
+    // 3. Clean & deduplicate Character States in Memory
+    const { states: cleanedStates, removedNames: removedStateNames } =
+      cleanAndDeduplicateCharacterStates(
+        curState.memory?.characterStates || [],
+        {
+          comp: cleanedActiveComp,
+          fallbackMcName: curState.player?.name,
+          knownValidNames: cleanedBank.portraits
+            .filter((p) => !isPortraitAutoScannedUnconfirmed(p))
+            .map((p) => p.name),
+          extraBlockedKeys: cultivationBlockedKeys,
+        },
+      );
+
+    // 4. Clean junk contacts from the current save's Showbiz Phone as well
+    const curPhone = curState.showbizPhone || createDefaultShowbizPhoneState();
+    const showbizMcName = getShowbizMcProfile(curState).name;
+    const phoneThreadCounts: Record<string, number> = {};
+    for (const [cid, msgs] of Object.entries(curPhone.dmThreads || {})) {
+      if (Array.isArray(msgs) && msgs.length > 0) {
+        phoneThreadCounts[cid] = msgs.length;
+      }
+    }
+    const cleanedPhoneContacts = cleanJunkShowbizContacts(
+      curPhone.contacts || [],
+      showbizMcName,
+      { threadCountById: phoneThreadCounts },
+    );
+    const phoneChanged = cleanedPhoneContacts.removedCount > 0;
+    const nextPhone: ShowbizPhoneState = phoneChanged
+      ? remapShowbizPhoneContactIds(
+          curPhone,
+          cleanedPhoneContacts.contacts,
+          cleanedPhoneContacts.mergedIdMap,
+        )
+      : curPhone;
 
     const prevPortraitMap = new Map(
       (curState.portraitBank?.portraits || []).map((p) => [
@@ -3467,26 +3555,101 @@ export default function App() {
         snippetMigratedCount += 1;
       }
     }
-    if (removedPortraitNames.length > 0 || snippetMigratedCount > 0) {
-      updatePortraitBankWithCompanionSync(() => cleanedBank);
-    }
-    if (removedStateNames.length > 0) {
-      updateMemoryWithCompanionSync((prev) => ({
+
+    const portraitChanged =
+      removedPortraitNames.length > 0 ||
+      snippetMigratedCount > 0 ||
+      (curState.portraitBank?.portraits || []).length !==
+        cleanedBank.portraits.length;
+    const statesChanged = removedStateNames.length > 0;
+    const compChanged =
+      removedCompNpcNames.length > 0 && Boolean(cleanedActiveComp) && Boolean(compKey);
+
+    if (portraitChanged || statesChanged || compChanged || phoneChanged) {
+      const nextMemory = statesChanged
+        ? {
+            ...curState.memory,
+            characterStates: cleanedStates,
+          }
+        : curState.memory;
+      const nextCompanions =
+        compChanged && cleanedActiveComp
+          ? (curState.companions || []).map((c) =>
+              c.id === cleanedActiveComp!.id ? cleanedActiveComp! : c,
+            )
+          : curState.companions;
+      const nextPortraitBank = portraitChanged
+        ? cleanedBank
+        : curState.portraitBank;
+      const nextCompPortraits =
+        portraitChanged && compKey
+          ? { ...(curState.companionPortraits || {}), [compKey]: cleanedBank }
+          : curState.companionPortraits;
+      const nextCompMemories =
+        statesChanged && compKey
+          ? { ...(curState.companionMemories || {}), [compKey]: nextMemory }
+          : curState.companionMemories;
+      const nextCompPhones =
+        phoneChanged && compKey
+          ? { ...(curState.companionPhones || {}), [compKey]: nextPhone }
+          : curState.companionPhones;
+
+      const nextSnapshot: ArkState = {
+        ...curState,
+        companions: nextCompanions,
+        portraitBank: nextPortraitBank,
+        companionPortraits: nextCompPortraits,
+        memory: nextMemory,
+        companionMemories: nextCompMemories,
+        showbizPhone: nextPhone,
+        companionPhones: nextCompPhones,
+      };
+      stateRef.current = nextSnapshot;
+      setState((prev) => ({
         ...prev,
-        characterStates: cleanedStates,
+        companions:
+          compChanged && cleanedActiveComp
+            ? (prev.companions || []).map((c) =>
+                c.id === cleanedActiveComp!.id ? cleanedActiveComp! : c,
+              )
+            : prev.companions,
+        portraitBank: portraitChanged ? cleanedBank : prev.portraitBank,
+        companionPortraits:
+          portraitChanged && compKey
+            ? { ...(prev.companionPortraits || {}), [compKey]: cleanedBank }
+            : prev.companionPortraits,
+        memory: statesChanged
+          ? { ...prev.memory, characterStates: cleanedStates }
+          : prev.memory,
+        companionMemories:
+          statesChanged && compKey
+            ? {
+                ...(prev.companionMemories || {}),
+                [compKey]: { ...prev.memory, characterStates: cleanedStates },
+              }
+            : prev.companionMemories,
+        showbizPhone: phoneChanged ? nextPhone : prev.showbizPhone,
+        companionPhones:
+          phoneChanged && compKey
+            ? { ...(prev.companionPhones || {}), [compKey]: nextPhone }
+            : prev.companionPhones,
       }));
+      // Immediately persist deletion to localStorage & IndexedDB
+      flushPersistNow(nextSnapshot, 'clean_junk_portraits');
     }
+
     const allRemoved = Array.from(
       new Set([
         ...removedPortraitNames,
         ...removedStateNames,
         ...removedCompNpcNames,
+        ...cleanedPhoneContacts.removedNames,
       ]),
     );
     if (allRemoved.length > 0) {
       const preview = allRemoved.slice(0, 4).join(', ');
       showBanner(
-        `Đã lọc bỏ & gộp trùng ${allRemoved.length} mục NPC rác (${preview}${
+        `Đã xóa & gộp trùng ${allRemoved.length} mục NPC rác (${preview}${
           allRemoved.length > 4 ? '...' : ''
         })${
           snippetMigratedCount > 0
@@ -3500,14 +3663,10 @@ export default function App() {
       );
     } else {
       showBanner(
-        'Danh sách NPC & dáng/biểu cảm nhân vật đã sạch, không phát hiện mục rác hay lyric/câu thoại ngắn.',
+        'Danh sách NPC & dáng/biểu cảm nhân vật đã sạch, không phát hiện mục rác, tên viết tắt hay địa danh.',
       );
     }
-  }, [
-    showBanner,
-    updateMemoryWithCompanionSync,
-    updatePortraitBankWithCompanionSync,
-  ]);
+  }, [flushPersistNow, showBanner]);
 
   const isSyncingTurnCharactersRef = useRef(false);
 
@@ -3518,7 +3677,8 @@ export default function App() {
     }
 
     const curState = stateRef.current;
-    const activeComp = getActiveCompanionFromState(curState);
+    // Chỉ đồng bộ từ Đồng hành thực sự gắn với save hiện tại (tuyệt đối không kéo NPC của save khác)
+    const activeComp = getStoryBoundCompanionFromState(curState);
     const turns = curState.turns || [];
     const safePage =
       turns.length > 0
@@ -3529,18 +3689,32 @@ export default function App() {
     const prevCount = (prevBank.portraits || []).length;
 
     // 1. Clean junk names & sync roster from active Companion / player profile
+    const mcNameForSync = (
+      activeComp?.mc?.name ||
+      curState.player?.name ||
+      ''
+    ).trim();
     const cultivationBlockedKeys = buildCultivationNonNpcKeys(
       curState.memory?.cultivation,
     );
+    const cleanedActiveComp: CompanionProfile | undefined = activeComp
+      ? {
+          ...activeComp,
+          npcs: cleanJunkCompanionNpcs(activeComp.npcs || [], {
+            mcName: mcNameForSync,
+            extraBlockedKeys: cultivationBlockedKeys,
+          }),
+        }
+      : undefined;
     const { bank: cleanedPrevBank, removedNames } = cleanJunkPortraitsFromBank(
       prevBank,
-      activeComp,
+      cleanedActiveComp,
       curState.player?.name,
       cultivationBlockedKeys,
     );
     const syncedFromCompBank = syncPortraitBankWithCompanion(
       cleanedPrevBank,
-      activeComp,
+      cleanedActiveComp,
       curState.player?.name,
       curState.memory?.storyClock,
     );
@@ -3564,11 +3738,16 @@ export default function App() {
       ((currentTurn.assistant || '').trim() || (currentTurn.user || '').trim())
     ) {
       const allowedKnownKeys = buildAllowedRosterKeys(
-        activeComp,
+        cleanedActiveComp,
         curState.player?.name,
       );
       const scanState: ArkState = {
         ...curState,
+        companions: cleanedActiveComp
+          ? (curState.companions || []).map((c) =>
+              c.id === cleanedActiveComp.id ? cleanedActiveComp : c,
+            )
+          : curState.companions,
         portraitBank: syncedFromCompBank,
       };
       const cleanTurnProse = stripNonSceneChatBlocks(
@@ -3627,12 +3806,7 @@ export default function App() {
           )
         ).slice(0, 180);
 
-        const aliasMatched = !cand.isMc
-          ? matchPortraitByName(
-              cleanName,
-              mergedPortraits.filter((p) => !p.isMc),
-            )
-          : undefined;
+        const aliasMatched = matchPortraitByName(cleanName, mergedPortraits);
         const existingIdx = mergedPortraits.findIndex(
           (p) =>
             (cand.npcId && p.npcId === cand.npcId) ||
@@ -3716,9 +3890,10 @@ export default function App() {
         ...syncedFromCompBank,
         portraits: mergedPortraits,
       },
-      activeComp,
+      cleanedActiveComp,
       curState.player?.name,
       cultivationBlockedKeys,
+      { aggressiveJunkClean: true },
     );
 
     updatePortraitBankWithCompanionSync(() => finalBank);
@@ -4409,7 +4584,7 @@ export default function App() {
     ) => {
       const manual = Boolean(options?.manual);
       const workingState = options?.stateOverride || stateRef.current;
-      const activeComp = getActiveCompanionFromState(workingState);
+      const activeComp = getStoryBoundCompanionFromState(workingState);
       const targetTurn = workingState.turns[turnIndex];
       if (!targetTurn) {
         if (manual) {
@@ -5359,7 +5534,7 @@ export default function App() {
       }
 
       // Deterministically advance Story Clock on every completed turn (independent of system wall-clock)
-      const activeCompForClock = getActiveCompanionFromState(latest);
+      const activeCompForClock = getStoryBoundCompanionFromState(latest);
       const curClock = normalizeStoryClock(latest.memory?.storyClock);
       let nextStoryClock: StoryClockState = curClock;
       let nextCultivationAfterTurn = latest.memory?.cultivation;
@@ -5635,6 +5810,27 @@ export default function App() {
           ? rawFinalText
           : undefined;
 
+      const prevAttachedImages = getTurnAttachedImages(baseTurn);
+      const shouldAutoClearAttachedImages =
+        result.ok &&
+        Boolean(finalText) &&
+        prevAttachedImages.length > 0 &&
+        latest.config.chatImageAutoClearAfterReply !== false;
+
+      if (shouldAutoClearAttachedImages) {
+        const baseAttachKey = buildTurnMediaKey('attach', baseTurn, resolvedTurnIndex);
+        revokeMediaKey(`inline:${baseAttachKey}`);
+        revokeMediaKey(baseAttachKey);
+        prevAttachedImages.forEach((src, imgIdx) => {
+          const slotKey = imgIdx === 0 ? baseAttachKey : `${baseAttachKey}:${imgIdx}`;
+          revokeMediaKey(`inline:${slotKey}`);
+          revokeMediaKey(slotKey);
+          if (isMediaRef(src)) {
+            void deleteMediaBlob(extractMediaKey(src));
+          }
+        });
+      }
+
       if (finalText) {
         updateTurnsWithCompanionSync((turns) =>
           turns.map((t) =>
@@ -5652,6 +5848,15 @@ export default function App() {
                   ...(turnClockSnapshot
                     ? { storyClockSnapshot: turnClockSnapshot }
                     : {}),
+                  ...(shouldAutoClearAttachedImages
+                    ? {
+                        imageData: '',
+                        imageList: undefined,
+                        attachedImageClearedCount:
+                          (t.attachedImageClearedCount || 0) +
+                          prevAttachedImages.length,
+                      }
+                    : {}),
                 }
               : t,
           ),
@@ -5662,6 +5867,15 @@ export default function App() {
         text: result.statusLabel,
         isErr: !result.ok,
       });
+
+      if (!result.ok && prevAttachedImages.length > 0) {
+        const firstLine = (result.text || '').split('\n')[0]?.trim();
+        showBanner(
+          firstLine ||
+            'Gửi ảnh đính kèm tới AI thất bại. Ảnh vẫn được giữ trên lượt để bạn thử lại.',
+          'err',
+        );
+      }
 
       // Auto-generate sequential 3-beat story illustrations (non-blocking) when enabled & ComfyUI/Seedream is configured
       const updatedTurnsSnapshot = finalText
@@ -5679,6 +5893,15 @@ export default function App() {
                   ...(result.ok ? { durationMs: elapsedMs } : {}),
                   ...(turnClockSnapshot
                     ? { storyClockSnapshot: turnClockSnapshot }
+                    : {}),
+                  ...(shouldAutoClearAttachedImages
+                    ? {
+                        imageData: '',
+                        imageList: undefined,
+                        attachedImageClearedCount:
+                          (t.attachedImageClearedCount || 0) +
+                          prevAttachedImages.length,
+                      }
                     : {}),
                 }
               : t,
@@ -5721,7 +5944,7 @@ export default function App() {
         latest.memory?.enabled &&
         latest.memory.autoMemory
       ) {
-        const activeCompForLocalMem = getActiveCompanionFromState(latest);
+        const activeCompForLocalMem = getStoryBoundCompanionFromState(latest);
         const knownCharNames = Array.from(
           new Set(
             [
@@ -5982,16 +6205,11 @@ export default function App() {
     activeStoryCompanionIdRef.current = null;
     turnPreClockRef.current.clear();
     setState((prev) => {
-      const activeComp = getActiveCompanionFromState(prev);
-      const freshPortraits = syncPortraitBankWithCompanion(
-        createDefaultPortraitBank({
-          autoGenerateOnAppear: prev.portraitBank?.autoGenerateOnAppear,
-          maxAutoPerTurn: prev.portraitBank?.maxAutoPerTurn,
-          includeMcAuto: prev.portraitBank?.includeMcAuto,
-        }),
-        activeComp,
-        prev.player.name,
-      );
+      const freshPortraits = createDefaultPortraitBank({
+        autoGenerateOnAppear: prev.portraitBank?.autoGenerateOnAppear,
+        maxAutoPerTurn: prev.portraitBank?.maxAutoPerTurn,
+        includeMcAuto: prev.portraitBank?.includeMcAuto,
+      });
       return {
         ...prev,
         checkpoint: {
@@ -6005,8 +6223,12 @@ export default function App() {
           portraitBank: JSON.parse(
             JSON.stringify(prev.portraitBank || createDefaultPortraitBank()),
           ),
+          showbizPhone: JSON.parse(
+            JSON.stringify(prev.showbizPhone || createDefaultShowbizPhoneState()),
+          ),
           context: { ...prev.context },
           activeCompanionId: prev.activeCompanionId,
+          activeStoryCompanionId: prev.activeStoryCompanionId ?? null,
           tawaPreset: JSON.parse(JSON.stringify(prev.tawaPreset)),
         },
         turns: [],
@@ -6021,7 +6243,9 @@ export default function App() {
           }),
         }),
         portraitBank: freshPortraits,
+        showbizPhone: createDefaultShowbizPhoneState(),
         activeStoryCompanionId: null,
+        activeSlotId: null,
         currentPage: 0,
         activeView: 'chat',
       };
@@ -6295,6 +6519,7 @@ export default function App() {
         companions: [syncedCompanion, ...prev.companions],
         activeCompanionId: newProfileId,
         activeStoryCompanionId: newProfileId,
+        activeSlotId: null,
         companionStories: {
           ...prev.companionStories,
           [newProfileId]: initialTurns,
@@ -6311,8 +6536,13 @@ export default function App() {
           ...(prev.companionContexts || {}),
           [newProfileId]: nextContext,
         },
+        companionPhones: {
+          ...(prev.companionPhones || {}),
+          [newProfileId]: createDefaultShowbizPhoneState(),
+        },
         memory: nextMemory,
         portraitBank: nextPortraitBank,
+        showbizPhone: createDefaultShowbizPhoneState(),
         turns: initialTurns,
         currentPage: 0,
         activeView: 'chat',
@@ -6477,21 +6707,105 @@ export default function App() {
     setImageCaption('');
   }, []);
 
-  // Chat image picker (supports batch selection up to MAX_PENDING_CHAT_IMAGES)
+  const handleUpdateChatImageConfig = useCallback(
+    (
+      patch: Partial<
+        Pick<
+          AppConfig,
+          | 'chatImageMaxInputMb'
+          | 'chatImageMaxDimension'
+          | 'chatImageQuality'
+          | 'chatImageAutoClearAfterReply'
+        >
+      >,
+    ) => {
+      setState((prev) => ({
+        ...prev,
+        config: {
+          ...prev.config,
+          ...(patch.chatImageMaxInputMb !== undefined
+            ? {
+                chatImageMaxInputMb: clampChatImageMaxInputMb(
+                  patch.chatImageMaxInputMb,
+                ),
+              }
+            : {}),
+          ...(patch.chatImageMaxDimension !== undefined
+            ? {
+                chatImageMaxDimension: clampChatImageMaxDimension(
+                  patch.chatImageMaxDimension,
+                ),
+              }
+            : {}),
+          ...(patch.chatImageQuality !== undefined
+            ? {
+                chatImageQuality: clampChatImageQuality(patch.chatImageQuality),
+              }
+            : {}),
+          ...(patch.chatImageAutoClearAfterReply !== undefined
+            ? {
+                chatImageAutoClearAfterReply: Boolean(
+                  patch.chatImageAutoClearAfterReply,
+                ),
+              }
+            : {}),
+        },
+      }));
+    },
+    [],
+  );
+
+  const handleClearTurnAttachedImages = useCallback(
+    (turnIndex: number) => {
+      const cur = stateRef.current;
+      const target = cur.turns[turnIndex];
+      if (!target) return;
+      const attached = getTurnAttachedImages(target);
+      if (!attached.length) return;
+
+      const baseAttachKey = buildTurnMediaKey('attach', target, turnIndex);
+      revokeMediaKey(`inline:${baseAttachKey}`);
+      revokeMediaKey(baseAttachKey);
+      attached.forEach((src, imgIdx) => {
+        const slotKey =
+          imgIdx === 0 ? baseAttachKey : `${baseAttachKey}:${imgIdx}`;
+        revokeMediaKey(`inline:${slotKey}`);
+        revokeMediaKey(slotKey);
+        if (isMediaRef(src)) {
+          void deleteMediaBlob(extractMediaKey(src));
+        }
+      });
+
+      updateTurnsWithCompanionSync((turns) =>
+        turns.map((t) =>
+          t.id === target.id
+            ? {
+                ...t,
+                imageData: '',
+                imageList: undefined,
+                attachedImageClearedCount:
+                  (t.attachedImageClearedCount || 0) + attached.length,
+              }
+            : t,
+        ),
+      );
+      window.setTimeout(() => {
+        flushPersistNow(stateRef.current, 'clear_attached_images');
+      }, 0);
+      showBanner(
+        `Đã xóa ${attached.length} ảnh tạm ở Trang ${turnIndex + 1} để nhẹ máy (vẫn giữ nguyên nội dung truyện & chú thích).`,
+      );
+    },
+    [flushPersistNow, showBanner, updateTurnsWithCompanionSync],
+  );
+
+  // Chat image picker (supports batch selection up to MAX_PENDING_CHAT_IMAGES with configurable limit & auto resize/compression)
   const handleChatImageFileChange = async (
     ev: React.ChangeEvent<HTMLInputElement>,
   ) => {
     const rawFiles = Array.from(ev.target.files || []);
     ev.target.value = '';
     if (!rawFiles.length) return;
-
-    const imageFiles = rawFiles.filter(
-      (file) => !file.type || file.type.startsWith('image/'),
-    );
-    if (!imageFiles.length) {
-      showBanner('Vui lòng chọn tệp hình ảnh hợp lệ.', 'err');
-      return;
-    }
 
     const remainingSlots =
       MAX_PENDING_CHAT_IMAGES - pendingImagesRef.current.length;
@@ -6503,51 +6817,75 @@ export default function App() {
       return;
     }
 
-    const filesToRead = imageFiles.slice(0, remainingSlots);
-    const skippedCount = imageFiles.length - filesToRead.length;
+    const filesToRead = rawFiles.slice(0, remainingSlots);
+    const skippedCount = rawFiles.length - filesToRead.length;
+    const cfg = stateRef.current.config;
+    const uploadSettings = {
+      maxInputMb: clampChatImageMaxInputMb(cfg.chatImageMaxInputMb),
+      maxDimension: clampChatImageMaxDimension(cfg.chatImageMaxDimension),
+      quality: clampChatImageQuality(cfg.chatImageQuality),
+    };
 
-    const readFileAsPending = (
-      file: File,
-      idx: number,
-    ): Promise<PendingImage | null> =>
-      new Promise((resolve) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-          const dataUrl = String(reader.result || '');
-          if (!dataUrl) {
-            resolve(null);
-            return;
-          }
-          resolve({
+    setIsPreparingChatImages(true);
+    try {
+      const loaded: PendingImage[] = [];
+      const errors: string[] = [];
+      let totalOrigBytes = 0;
+      let totalCompBytes = 0;
+      let anyOptimized = false;
+
+      for (let idx = 0; idx < filesToRead.length; idx += 1) {
+        const file = filesToRead[idx];
+        const prepared = await prepareChatImageFile(file, uploadSettings);
+        if (prepared.ok && prepared.dataUrl) {
+          loaded.push({
             id: `pimg_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 6)}`,
-            dataUrl,
-            name: file.name || `anh_${idx + 1}.png`,
+            dataUrl: prepared.dataUrl,
+            name: file.name || `anh_${idx + 1}.jpg`,
+            originalBytes: prepared.originalBytes,
+            compressedBytes: prepared.compressedBytes,
+            width: prepared.width,
+            height: prepared.height,
           });
-        };
-        reader.onerror = () => resolve(null);
-        reader.readAsDataURL(file);
-      });
+          totalOrigBytes += prepared.originalBytes || 0;
+          totalCompBytes += prepared.compressedBytes || 0;
+          if (prepared.wasCompressed || prepared.wasResized) {
+            anyOptimized = true;
+          }
+        } else {
+          errors.push(
+            prepared.error || `Không thể đọc tệp ảnh "${file.name || idx + 1}".`,
+          );
+        }
+      }
 
-    const loaded = (
-      await Promise.all(filesToRead.map((f, idx) => readFileAsPending(f, idx)))
-    ).filter((item): item is PendingImage => Boolean(item));
+      if (loaded.length > 0) {
+        setPendingImages((prev) => {
+          const next = [...prev, ...loaded].slice(0, MAX_PENDING_CHAT_IMAGES);
+          pendingImagesRef.current = next;
+          return next;
+        });
+      }
 
-    if (!loaded.length) {
-      showBanner('Không thể đọc tệp ảnh đã chọn.', 'err');
-      return;
-    }
-
-    setPendingImages((prev) => {
-      const next = [...prev, ...loaded].slice(0, MAX_PENDING_CHAT_IMAGES);
-      pendingImagesRef.current = next;
-      return next;
-    });
-
-    if (skippedCount > 0) {
-      showBanner(
-        `Chỉ hỗ trợ tối đa ${MAX_PENDING_CHAT_IMAGES} ảnh mỗi lượt — đã thêm ${loaded.length} ảnh đầu và bỏ qua ${skippedCount} ảnh dư.`,
-        'err',
-      );
+      if (errors.length > 0 && loaded.length === 0) {
+        showBanner(errors[0], 'err');
+      } else if (errors.length > 0) {
+        showBanner(
+          `Đã nạp ${loaded.length} ảnh; bỏ qua ${errors.length} ảnh lỗi: ${errors[0]}`,
+          'err',
+        );
+      } else if (skippedCount > 0) {
+        showBanner(
+          `Chỉ hỗ trợ tối đa ${MAX_PENDING_CHAT_IMAGES} ảnh mỗi lượt — đã thêm ${loaded.length} ảnh đầu và bỏ qua ${skippedCount} ảnh dư.`,
+          'err',
+        );
+      } else if (anyOptimized && totalOrigBytes > 0 && totalCompBytes > 0) {
+        showBanner(
+          `Đã chuẩn hóa ${loaded.length} ảnh (${formatBytesCompact(totalOrigBytes)} → ${formatBytesCompact(totalCompBytes)}) để gửi nhanh & ổn định.`,
+        );
+      }
+    } finally {
+      setIsPreparingChatImages(false);
     }
   };
 
@@ -6649,18 +6987,22 @@ export default function App() {
               }
             : rawImportedMemory;
 
-        const activeComp = getActiveCompanionFromState(prev);
+        // Không tự kéo NPC từ Đồng hành save khác khi nhập một file save độc lập
         const nextPortraitBank = root.portraitBank
-          ? normalizePortraitBank(root.portraitBank)
-          : syncPortraitBankWithCompanion(
-              createDefaultPortraitBank({
-                autoGenerateOnAppear: prev.portraitBank?.autoGenerateOnAppear,
-                maxAutoPerTurn: prev.portraitBank?.maxAutoPerTurn,
-                includeMcAuto: prev.portraitBank?.includeMcAuto,
-              }),
-              activeComp,
+          ? cleanJunkPortraitsFromBank(
+              normalizePortraitBank(root.portraitBank),
+              undefined,
               nextPlayer.name,
-            );
+              buildCultivationNonNpcKeys(nextMemory.cultivation),
+            ).bank
+          : createDefaultPortraitBank({
+              autoGenerateOnAppear: prev.portraitBank?.autoGenerateOnAppear,
+              maxAutoPerTurn: prev.portraitBank?.maxAutoPerTurn,
+              includeMcAuto: prev.portraitBank?.includeMcAuto,
+            });
+        const nextShowbizPhone = root.showbizPhone
+          ? normalizeShowbizPhoneState(root.showbizPhone)
+          : createDefaultShowbizPhoneState();
 
         const resolvedImportContext = resolveContextForTransition({
           currentContext: prev.context,
@@ -6689,6 +7031,8 @@ export default function App() {
           world: { ...nextWorld },
           memory: JSON.parse(JSON.stringify(nextMemory)),
           portraitBank: JSON.parse(JSON.stringify(nextPortraitBank)),
+          showbizPhone: JSON.parse(JSON.stringify(nextShowbizPhone)),
+          activeStoryCompanionId: null,
           context: { ...nextContext },
           tawaPreset: JSON.parse(JSON.stringify(nextPreset)),
         };
@@ -6840,11 +7184,13 @@ export default function App() {
           companionStories: importedCompanionStories,
           companionMemories: importedCompanionMemories,
           portraitBank: nextPortraitBank,
+          showbizPhone: nextShowbizPhone,
           companionPortraits: importedCompanionPortraits,
           companionContexts: importedCompanionContexts,
           animeJourneyHistory: importedAnimeJourneyHistory,
           turns: extracted,
           activeStoryCompanionId: null,
+          activeSlotId: newSlot.id,
           currentPage: extracted.length ? extracted.length - 1 : 0,
           slots: [newSlot, ...prev.slots],
           activeView: 'chat',
@@ -6904,12 +7250,14 @@ export default function App() {
         ? { cultivation: normalizeCultivationProfile(baseMem.cultivation) }
         : {}),
     }).memory;
+    const storyComp = getStoryBoundCompanionFromState(cur);
     const cleanedSlotPortraits = cleanJunkPortraitsFromBank(
       cur.portraitBank || createDefaultPortraitBank(),
-      getActiveCompanionFromState(cur),
+      storyComp,
       cur.player?.name,
       buildCultivationNonNpcKeys(compactedMemory.cultivation),
     ).bank;
+    const slotPhone = normalizeShowbizPhoneState(cur.showbizPhone);
     const slot = {
       id: `slot_${Date.now()}`,
       name: `${cur.player.name || 'Slot'} (${cur.turns.length} lượt)`,
@@ -6919,19 +7267,25 @@ export default function App() {
       world: { ...cur.world },
       memory: JSON.parse(JSON.stringify(compactedMemory)),
       portraitBank: JSON.parse(JSON.stringify(cleanedSlotPortraits)),
+      showbizPhone: JSON.parse(JSON.stringify(slotPhone)),
+      activeStoryCompanionId: cur.activeStoryCompanionId ?? null,
+      companionSnapshot: storyComp
+        ? (JSON.parse(JSON.stringify(storyComp)) as CompanionProfile)
+        : null,
       context: { ...cur.context },
       tawaPreset: JSON.parse(JSON.stringify(cur.tawaPreset)),
     };
     const nextState: ArkState = {
       ...cur,
       memory: compactedMemory,
+      activeSlotId: slot.id,
       slots: [slot, ...cur.slots],
     };
     stateRef.current = nextState;
     setState(nextState);
     flushPersistNow(nextState, 'slot_save');
     triggerConfirm('save_slot');
-    showBanner(`Đã lưu vào slot: ${slot.name} (đã đồng bộ Auto-Save).`);
+    showBanner(`Đã lưu vào slot: ${slot.name} (đã cô lập NPC & đồng bộ Auto-Save).`);
   }, [flushPersistNow, showBanner, triggerConfirm]);
 
   const handleDownloadSave = useCallback(
@@ -6952,12 +7306,18 @@ export default function App() {
       }).memory;
       const exportPlayer = target ? target.player : cur.player;
       const exportWorld = target ? target.world : cur.world;
+      const exportComp = target
+        ? target.companionSnapshot || undefined
+        : getStoryBoundCompanionFromState(cur);
       const exportPortraits = cleanJunkPortraitsFromBank(
         target?.portraitBank || cur.portraitBank || createDefaultPortraitBank(),
-        getActiveCompanionFromState(cur),
+        exportComp,
         exportPlayer?.name,
         buildCultivationNonNpcKeys(compactedMemory.cultivation),
       ).bank;
+      const exportPhone = normalizeShowbizPhoneState(
+        target?.showbizPhone || cur.showbizPhone,
+      );
       const exportContext = target
         ? resolveContextForTransition({
             currentContext: cur.context,
@@ -6979,6 +7339,7 @@ export default function App() {
         context: exportContext,
         memory: compactedMemory,
         portraitBank: exportPortraits,
+        showbizPhone: exportPhone,
         turns: hydratedTurns,
         savedState: { turns: hydratedTurns },
       };
@@ -7061,10 +7422,13 @@ export default function App() {
         memory: compactedMemory,
         companionMemories: compactedCompanionMemories,
         portraitBank: cur.portraitBank,
+        showbizPhone: cur.showbizPhone || createDefaultShowbizPhoneState(),
         companionPortraits: cur.companionPortraits,
         companionContexts: cur.companionContexts || {},
+        companionPhones: cur.companionPhones || {},
         companions: cur.companions || [],
         activeCompanionId: cur.activeCompanionId,
+        activeStoryCompanionId: cur.activeStoryCompanionId ?? null,
         companionStories: hydratedCompanionStories,
         animeJourneyHistory: cur.animeJourneyHistory || [],
         turns: hydratedTurns,
@@ -7085,7 +7449,12 @@ export default function App() {
       showBanner('Không có checkpoint để hoàn tác.', 'err');
       return;
     }
-    activeStoryCompanionIdRef.current = null;
+    const restoredBoundId =
+      typeof cp.activeStoryCompanionId === 'string' &&
+      stateRef.current.companions.some((c) => c.id === cp.activeStoryCompanionId)
+        ? cp.activeStoryCompanionId
+        : null;
+    activeStoryCompanionIdRef.current = restoredBoundId;
     turnPreClockRef.current.clear();
     const restoredTurns = ensureUniqueTurnIds(
       JSON.parse(JSON.stringify(cp.turns || [])) as Turn[],
@@ -7101,11 +7470,15 @@ export default function App() {
         prev.companions.some((c) => c.id === cp.activeCompanionId)
           ? cp.activeCompanionId
           : prev.activeCompanionId,
-      activeStoryCompanionId: null,
+      activeStoryCompanionId: restoredBoundId,
+      activeSlotId: null,
       memory: cp.memory ? normalizeMemoryConfig(cp.memory) : prev.memory,
       portraitBank: cp.portraitBank
         ? normalizePortraitBank(cp.portraitBank)
         : prev.portraitBank,
+      showbizPhone: cp.showbizPhone
+        ? normalizeShowbizPhoneState(cp.showbizPhone)
+        : createDefaultShowbizPhoneState(),
       tawaPreset: cp.tawaPreset
         ? normalizeTawaPreset(cp.tawaPreset, prev.tawaPreset)
         : prev.tawaPreset,
@@ -7113,6 +7486,90 @@ export default function App() {
     }));
     showBanner('Đã hoàn tác về checkpoint trước đó.');
   }, [showBanner]);
+
+  const handleUpdateShowbizPhone = useCallback(
+    (updater: (prev: ShowbizPhoneState) => ShowbizPhoneState) => {
+      const curState = stateRef.current;
+      const curPhone = curState.showbizPhone || createDefaultShowbizPhoneState();
+      const nextPhone = normalizeShowbizPhoneState(updater(curPhone));
+      const compKey = activeStoryCompanionIdRef.current || '';
+      const nextCompPhones = compKey
+        ? { ...(curState.companionPhones || {}), [compKey]: nextPhone }
+        : curState.companionPhones || {};
+      const nextSlots = curState.activeSlotId
+        ? (curState.slots || []).map((slot) =>
+            slot.id === curState.activeSlotId
+              ? { ...slot, showbizPhone: nextPhone }
+              : slot,
+          )
+        : curState.slots;
+
+      const nextSnapshot: ArkState = {
+        ...curState,
+        showbizPhone: nextPhone,
+        companionPhones: nextCompPhones,
+        slots: nextSlots,
+      };
+      stateRef.current = nextSnapshot;
+      setState((prev) => ({
+        ...prev,
+        showbizPhone: nextPhone,
+        companionPhones: compKey
+          ? { ...(prev.companionPhones || {}), [compKey]: nextPhone }
+          : prev.companionPhones || {},
+        slots: prev.activeSlotId
+          ? (prev.slots || []).map((slot) =>
+              slot.id === prev.activeSlotId
+                ? { ...slot, showbizPhone: nextPhone }
+                : slot,
+            )
+          : prev.slots,
+      }));
+      flushPersistNow(nextSnapshot, 'showbiz_phone_update');
+    },
+    [flushPersistNow],
+  );
+
+  const handleUpdateShowbizPhoneAiConfig = useCallback(
+    (nextPhoneCfg: ShowbizPhoneApiConfig) => {
+      const cleanCfg = sanitizeShowbizPhoneApiConfig(nextPhoneCfg);
+      const curState = stateRef.current;
+      const nextTaskModels = { ...(curState.config.taskModels || {}) };
+      if (cleanCfg.model) {
+        nextTaskModels.showbizPhone = cleanCfg.model;
+      } else {
+        delete nextTaskModels.showbizPhone;
+      }
+      const nextConfig: AppConfig = {
+        ...curState.config,
+        taskModels: nextTaskModels,
+        showbizPhoneConfig: cleanCfg,
+      };
+      const nextSnapshot: ArkState = {
+        ...curState,
+        config: nextConfig,
+      };
+      stateRef.current = nextSnapshot;
+      setState((prev) => {
+        const prevTaskModels = { ...(prev.config.taskModels || {}) };
+        if (cleanCfg.model) {
+          prevTaskModels.showbizPhone = cleanCfg.model;
+        } else {
+          delete prevTaskModels.showbizPhone;
+        }
+        return {
+          ...prev,
+          config: {
+            ...prev.config,
+            taskModels: prevTaskModels,
+            showbizPhoneConfig: cleanCfg,
+          },
+        };
+      });
+      flushPersistNow(nextSnapshot, 'showbiz_phone_ai_config');
+    },
+    [flushPersistNow],
+  );
 
   const handleRequestResetClean = useCallback(() => {
     setConfirmDialog({
@@ -7614,6 +8071,16 @@ export default function App() {
         turns: clonedTurns,
       }).context;
 
+      const existingPhones = { ...(prev.companionPhones || {}) };
+      if (prev.activeStoryCompanionId) {
+        existingPhones[prev.activeStoryCompanionId] = normalizeShowbizPhoneState(
+          prev.showbizPhone,
+        );
+      }
+      const compPhone = existingPhones[compKey]
+        ? normalizeShowbizPhoneState(existingPhones[compKey])
+        : createDefaultShowbizPhoneState();
+
       return {
         ...prev,
         checkpoint,
@@ -7621,6 +8088,7 @@ export default function App() {
         world: nextCompWorld,
         context: nextCompContext,
         activeStoryCompanionId: compKey,
+        activeSlotId: null,
         companionStories: {
           ...existingStories,
           [compKey]: clonedTurns,
@@ -7637,8 +8105,13 @@ export default function App() {
           ...existingContexts,
           [compKey]: nextCompContext,
         },
+        companionPhones: {
+          ...existingPhones,
+          [compKey]: compPhone,
+        },
         memory: compMemory,
         portraitBank: compPortraits,
+        showbizPhone: compPhone,
         turns: clonedTurns,
         currentPage: Math.max(0, clonedTurns.length - 1),
         activeView: 'chat',
@@ -8016,7 +8489,7 @@ export default function App() {
             )}
 
             {state.activeView === 'chat' && (() => {
-              const activeComp = getActiveCompanionFromState(state);
+              const activeComp = getStoryBoundCompanionFromState(state);
               return (
                 <ChatView
                   appState={state}
@@ -8038,6 +8511,19 @@ export default function App() {
                   streamingTurnId={streamingState?.turnId ?? null}
                   streamingText={streamingState?.text ?? ''}
                   pendingImages={pendingImages}
+                  isPreparingChatImages={isPreparingChatImages}
+                  chatImageMaxInputMb={clampChatImageMaxInputMb(
+                    state.config.chatImageMaxInputMb,
+                  )}
+                  chatImageMaxDimension={clampChatImageMaxDimension(
+                    state.config.chatImageMaxDimension,
+                  )}
+                  chatImageQuality={clampChatImageQuality(
+                    state.config.chatImageQuality,
+                  )}
+                  chatImageAutoClearAfterReply={
+                    state.config.chatImageAutoClearAfterReply !== false
+                  }
                   imageCaption={imageCaption}
                   storyImageConfig={state.storyImage}
                   memoryConfig={state.memory}
@@ -8277,6 +8763,8 @@ export default function App() {
                   }}
                   onRemovePendingImage={handleRemovePendingImage}
                   onClearPendingImages={handleClearPendingImages}
+                  onUpdateChatImageConfig={handleUpdateChatImageConfig}
+                  onClearTurnAttachedImages={handleClearTurnAttachedImages}
                   onSendTurn={handleSendNewTurn}
                   onDownloadImage={handleDownloadImage}
                   onNotify={showBanner}
@@ -8291,6 +8779,8 @@ export default function App() {
                   isQuickBackingUp={isQuickBackingUp}
                   onQuickBackup={() => void handleDownloadFullBackup()}
                   onDismissBackupReminder={undefined}
+                  onUpdateShowbizPhone={handleUpdateShowbizPhone}
+                  onUpdateShowbizPhoneAiConfig={handleUpdateShowbizPhoneAiConfig}
                 />
               );
             })()}
@@ -8876,7 +9366,14 @@ export default function App() {
                 onLoadSlot={(idx) => {
                   const s = stateRef.current.slots[idx];
                   if (!s) return;
-                  activeStoryCompanionIdRef.current = null;
+                  const restoredBoundId =
+                    typeof s.activeStoryCompanionId === 'string' &&
+                    stateRef.current.companions.some(
+                      (c) => c.id === s.activeStoryCompanionId,
+                    )
+                      ? s.activeStoryCompanionId
+                      : null;
+                  activeStoryCompanionIdRef.current = restoredBoundId;
                   turnPreClockRef.current.clear();
                   const loadedTurns = ensureUniqueTurnIds(
                     JSON.parse(JSON.stringify(s.turns || [])) as Turn[],
@@ -8901,9 +9398,19 @@ export default function App() {
                           autoStateTracker: prev.memory?.autoStateTracker,
                           autoRollingSummary: prev.memory?.autoRollingSummary,
                         });
-                    const activeComp = getActiveCompanionFromState(prev);
+                    // Cô lập NPC theo đúng save/slot này — tuyệt đối không kéo NPC của Đồng hành/save khác!
+                    const slotComp =
+                      s.companionSnapshot ||
+                      (restoredBoundId
+                        ? prev.companions.find((c) => c.id === restoredBoundId)
+                        : undefined);
                     const nextPortraits = s.portraitBank
-                      ? normalizePortraitBank(s.portraitBank)
+                      ? cleanJunkPortraitsFromBank(
+                          normalizePortraitBank(s.portraitBank),
+                          slotComp,
+                          nextPlayer.name,
+                          buildCultivationNonNpcKeys(nextMemory.cultivation),
+                        ).bank
                       : syncPortraitBankWithCompanion(
                           createDefaultPortraitBank({
                             autoGenerateOnAppear:
@@ -8911,40 +9418,48 @@ export default function App() {
                             maxAutoPerTurn: prev.portraitBank?.maxAutoPerTurn,
                             includeMcAuto: prev.portraitBank?.includeMcAuto,
                           }),
-                          activeComp,
+                          slotComp,
                           nextPlayer.name,
+                          nextMemory.storyClock,
                         );
+                    const nextPhone = s.showbizPhone
+                      ? normalizeShowbizPhoneState(s.showbizPhone)
+                      : createDefaultShowbizPhoneState();
                     const resolvedSlotContext = resolveContextForTransition({
                       currentContext: prev.context,
                       incomingContext: s.context || null,
                       world: nextWorld,
                       player: nextPlayer,
-                      companion: null,
+                      companion: slotComp || null,
                       portraits: nextPortraits.portraits,
                       memory: nextMemory,
                       turns: loadedTurns,
                     });
-                    return {
+                    const nextState: ArkState = {
                       ...prev,
                       turns: loadedTurns,
-                      activeStoryCompanionId: null,
+                      activeStoryCompanionId: restoredBoundId,
+                      activeSlotId: s.id || null,
                       player: nextPlayer,
                       world: nextWorld,
                       context: resolvedSlotContext.context,
                       memory: nextMemory,
                       portraitBank: nextPortraits,
+                      showbizPhone: nextPhone,
                       tawaPreset: s.tawaPreset
                         ? normalizeTawaPreset(s.tawaPreset, prev.tawaPreset)
                         : prev.tawaPreset,
                       currentPage: Math.max(0, loadedTurns.length - 1),
                       activeView: 'chat',
                     };
+                    stateRef.current = nextState;
+                    return nextState;
                   });
                   showBanner(
-                    `Đã nạp slot "${s.name || 'Save'}"${
+                    `Đã nạp slot "${s.name || 'Save'}" (đã cô lập dữ liệu NPC & Điện thoại theo save)${
                       slotHasCustomContext
-                        ? ' · Đã khôi phục Ghi chú ngữ cảnh của slot.'
-                        : ' · Đã tự cập nhật Ghi chú thực thể & thế giới khớp bối cảnh.'
+                        ? ' · Khôi phục Ghi chú ngữ cảnh của slot.'
+                        : ' · Đã cập nhật ngữ cảnh khớp save.'
                     }`,
                   );
                 }}

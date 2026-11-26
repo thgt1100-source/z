@@ -581,9 +581,50 @@ async function startServer(): Promise<void> {
   const app = express();
   app.disable('x-powered-by');
 
-  app.post('/api/proxy', express.json({ limit: '50mb' }), (req, res) => {
-    void handleApiProxy(req, res);
-  });
+  app.post(
+    '/api/proxy',
+    express.json({ limit: '80mb' }),
+    (req, res) => {
+      void handleApiProxy(req, res);
+    },
+  );
+
+  // Ensure JSON parser errors (e.g. HTTP 413 Payload Too Large or invalid JSON) on /api/proxy
+  // always return structured JSON rather than Express's default HTML error page.
+  app.use(
+    '/api/proxy',
+    (
+      err: Error & { status?: number; statusCode?: number; type?: string },
+      _req: Request,
+      res: Response,
+      next: express.NextFunction,
+    ) => {
+      if (!err) {
+        next();
+        return;
+      }
+      if (err.type === 'entity.too.large' || err.status === 413) {
+        res.status(413).json({
+          error: {
+            message:
+              'Gói dữ liệu ảnh gửi qua Server Proxy vượt quá giới hạn 80MB. Hãy bật giảm độ phân giải ảnh hoặc gửi ít ảnh hơn mỗi lượt.',
+          },
+        });
+        return;
+      }
+      const status =
+        typeof err.status === 'number' && err.status >= 400 && err.status < 600
+          ? err.status
+          : 400;
+      res.status(status).json({
+        error: {
+          message:
+            err.message ||
+            'Dữ liệu gửi lên Server Proxy không hợp lệ.',
+        },
+      });
+    },
+  );
 
   if (IS_PROD) {
     const distDir = path.resolve(__dirname, 'dist');

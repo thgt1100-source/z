@@ -964,6 +964,27 @@ function escapeRegExpChars(s?: string | null): string {
   return String(s ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+const AMBIGUOUS_SHORT_SURNAME_ALIAS_SET = new Set([
+  'kim',
+  'lee',
+  'han',
+  'seo',
+  'min',
+  'jin',
+  'cho',
+  'bae',
+  'son',
+  'cha',
+  'nam',
+  'yoo',
+  'lim',
+  'lin',
+  'liu',
+  'chen',
+  'tran',
+  'pham',
+]);
+
 export function findKnownCelebritiesInText(
   text: string,
 ): Array<{
@@ -974,6 +995,28 @@ export function findKnownCelebritiesInText(
 }> {
   const raw = String(text || '');
   if (!raw.trim()) return [];
+
+  // Pass 1: Collect all multi-word celebrity spans first so single-word aliases (e.g. "Kim" for Kim Kardashian)
+  // never falsely trigger inside another celebrity's full name (e.g. "Jennie Kim", "Kim Jisoo").
+  const multiWordOccupiedSpans: Array<{ start: number; end: number; canonicalName: string }> = [];
+  for (const celeb of KNOWN_CELEBRITY_LIST) {
+    const multiTerms = [celeb.canonicalName, ...(celeb.aliases || [])]
+      .map((t) => t.trim())
+      .filter((t) => t.length >= 3 && /\s/.test(t));
+    for (const term of multiTerms) {
+      const escaped = escapeRegExpChars(term);
+      const re = new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, 'giu');
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(raw)) !== null) {
+        multiWordOccupiedSpans.push({
+          start: m.index,
+          end: m.index + m[0].length,
+          canonicalName: celeb.canonicalName,
+        });
+      }
+    }
+  }
+
   const hits: Array<{
     displayName: string;
     canonicalName: string;
@@ -992,6 +1035,7 @@ export function findKnownCelebritiesInText(
 
     for (const term of terms) {
       const isSingleWord = !/\s/.test(term);
+      const termLower = term.toLowerCase();
       const escaped = escapeRegExpChars(term);
       const re = new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, 'giu');
       let m: RegExpExecArray | null;
@@ -999,10 +1043,46 @@ export function findKnownCelebritiesInText(
       let lastMatchedText = '';
       while ((m = re.exec(raw)) !== null) {
         if (isSingleWord && !/^[\p{Lu}]/u.test(m[0])) continue;
+        const mStart = m.index;
+        const mEnd = m.index + m[0].length;
+        if (isSingleWord) {
+          // Skip if this single-word token sits inside another celebrity's multi-word match (e.g. "Kim" inside "Jennie Kim")
+          const overlapsOtherMulti = multiWordOccupiedSpans.some(
+            (sp) =>
+              sp.canonicalName !== celeb.canonicalName &&
+              mStart >= sp.start &&
+              mEnd <= sp.end,
+          );
+          if (overlapsOtherMulti) continue;
+
+          // For ambiguous short surname aliases like "Kim", do not match if directly adjacent to another capitalized personal name
+          // that is NOT part of this celebrity's own full name (e.g. "Jennie Kim", "Kim Taehyung", "Kim Minji")
+          if (AMBIGUOUS_SHORT_SURNAME_ALIAS_SET.has(termLower)) {
+            const beforeWordMatch = raw
+              .slice(Math.max(0, mStart - 24), mStart)
+              .match(/([\p{Lu}][\p{Ll}\p{Lu}'’-]{1,18})\s+$/u);
+            const afterWordMatch = raw
+              .slice(mEnd, Math.min(raw.length, mEnd + 24))
+              .match(/^\s+([\p{Lu}][\p{Ll}\p{Lu}'’-]{1,18})/u);
+            const celebNameTokens = new Set(
+              normalizeCharacterKey(celeb.canonicalName).split(/\s+/),
+            );
+            const hasForeignPrevCap =
+              Boolean(beforeWordMatch?.[1]) &&
+              !celebNameTokens.has(normalizeCharacterKey(beforeWordMatch![1])) &&
+              !/^(?:anh|chi|co|em|ong|ba|cau|nang|chang|nhu|con|va|hay|voi|tu|cua|cho|o|tai|trong|sau|truoc)$/i.test(
+                normalizeCharacterKey(beforeWordMatch![1]),
+              );
+            const hasForeignNextCap =
+              Boolean(afterWordMatch?.[1]) &&
+              !celebNameTokens.has(normalizeCharacterKey(afterWordMatch![1]));
+            if (hasForeignPrevCap || hasForeignNextCap) continue;
+          }
+        }
         termCount += 1;
         totalCount += 1;
-        if (m.index > bestLast) {
-          bestLast = m.index;
+        if (mStart > bestLast) {
+          bestLast = mStart;
           lastMatchedText = m[0];
         }
       }
@@ -2885,7 +2965,71 @@ const XIANXIA_NON_PERSON_EXACT_KEYS = new Set([
   'tham dong',
   'bich thuy',
   'co lam',
+  // Famous mountains, mountain ranges, rivers, lakes, passes & landmarks (never NPCs)
+  'hoanh doan son',
+  'hoanh doan',
+  'doan son',
+  'hoa son',
+  'hoang son',
+  'tung son',
+  'thai son',
+  'hanh son',
+  'hang son',
+  'thuc son',
+  'lu son',
+  'thien son',
+  'con lon',
+  'con lon son',
+  'nga mi',
+  'nga mi son',
+  'vo dang',
+  'vo dang son',
+  'thieu lam',
+  'truong bach son',
+  'chung nam son',
+  'ngu dai son',
+  'nhan dang son',
+  'hoang ha',
+  'truong giang',
+  'dong hai',
+  'tay hai',
+  'nam hai',
+  'bac hai',
+  'tay ho',
+  'dong dinh ho',
+  'ngoc mon quan',
+  'thien mon quan',
+  'nhan mon quan',
+  'tay vuc',
+  'nam cuong',
+  'bac mac',
+  'trung nguyen',
+  'giang nam',
+  'tay bac',
+  'dong bac',
+  'tay nam',
+  'dong nam',
 ]);
+
+// Short 1–2 uppercase-letter abbreviations/initials, system codes, or bracketed/prefixed code labels
+// e.g. "VT", "HS", "NPC", "NVC", "VT [Vô Trần]", "HS [Hoành Đoạn Sơn]", "[Vô Trần]", "VT: Vô Trần"
+const SHORT_UPPERCASE_CODE_RE = /^[\p{Lu}\d]{1,2}$/u;
+const SYSTEM_ROLE_CODE_RE =
+  /^(?:NPC|NVC|MC|NV|AI|UI|UX|HP|MP|XP|EXP|LV|LVL|GM|DM|POV|BGM|SFX|OST|CG|BG|FX|END|ACT|TBA|TBD|NULL|NONE|TEST|DEMO|VTV|CLB|VIP)$/i;
+const BRACKETED_OR_PREFIXED_CODE_NAME_RE =
+  /^(?:[\p{Lu}]{1,3}\s*\[[^\]]+\]|\[[^\]]+\]|(?:[\p{Lu}]{2,3}|NPC|NVC|MC|NV)\s*[:–—|]\s*.+|(?:[\p{Lu}]{2,3}|NPC|NVC|MC|NV)\s+-\s+.+|[\p{Lu}]\s*[:–—|]\s*.+)$/u;
+
+export function isShortCodeOrBracketedJunkName(rawName: string): boolean {
+  const trimmed = String(rawName || '')
+    .replace(/[*_`~#<>]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!trimmed) return true;
+  if (SHORT_UPPERCASE_CODE_RE.test(trimmed)) return true;
+  if (SYSTEM_ROLE_CODE_RE.test(trimmed)) return true;
+  if (BRACKETED_OR_PREFIXED_CODE_NAME_RE.test(trimmed)) return true;
+  return false;
+}
 
 // Diacritic-aware cultivation realms, stages, tiers, and internal energy concepts
 const XIANXIA_REALM_OR_STAGE_RE =
@@ -2896,22 +3040,36 @@ const XIANXIA_REALM_TRAILING_SUFFIX_RE =
 
 // Unconditional item / weapon / talisman / treasure / technique trailing suffixes (NEVER a human given name)
 const XIANXIA_ITEM_OR_TECHNIQUE_SUFFIX_RE =
-  /(?:^|\s)(?:kiếm|đao|thương|kích|phủ|trượng|côn|bổng|roi|châm|ám\s+khí|phù|bùa|phù\s+lục|phù\s+ấn|đạo\s+ấn|pháp\s+ấn|dược|hoàn|tán|cao|thạch|thảo|quả|tủy|dịch|giáp|bào|đỉnh|lô|trận|trận\s+bàn|trận\s+đồ|trận\s+kỳ|trận\s+pháp|pháp\s+bảo|pháp\s+khí|linh\s+khí|tiên\s+khí|thần\s+binh|chí\s+bảo|bảo\s+vật|hồn\s+khí|ngọc\s+giản|ngọc\s+bội|ngọc\s+phù|trữ\s+vật|hồ\s+lô|bảo\s+tháp|cổ\s+kính|hồn\s+đăng|linh\s+tửu|linh\s+trà|quyết|công\s+pháp|tâm\s+pháp|thân\s+pháp|kiếm\s+pháp|đao\s+pháp|chưởng\s+pháp|quyền\s+pháp|bộ\s+pháp|chỉ\s+pháp|khinh\s+công|nội\s+công|thần\s+công|tà\s+công|đại\s+pháp|bảo\s+điển|thần\s+điển|nhật\s+nguyệt\s+giám|chân\s+kinh|bí\s+thuật|đạo\s+thuật|pháp\s+thuật|thần\s+thông|chiêu\s+thức|tuyệt\s+học|bí\s+tịch|chưởng|quyền|trảo|cước|kình|tụ\s+linh|dẫn\s+khí|ngưng\s+thần|thổ\s+nạp|vận\s+công|tẩy\s+tủy|dưỡng\s+thần|hộ\s+mạch|tĩnh\s+âm)$/iu;
+  /(?:^|\s)(?:kiếm|đao|thương|kích|phủ|trượng|côn|bổng|roi|châm|ám\s+khí|phù|bùa|phù\s+lục|phù\s+ấn|đạo\s+ấn|pháp\s+ấn|dược|hoàn|tán|cao|thạch|thảo|quả|tủy|dịch|giáp|bào|đỉnh|lô|trận|trận\s+bàn|trận\s+đồ|trận\s+kỳ|trận\s+pháp|pháp\s+bảo|pháp\s+khí|linh\s+khí|tiên\s+khí|thần\s+binh|chí\s+bảo|bảo\s+vật|hồn\s+khí|ngọc\s+giản|ngọc\s+bội|ngọc\s+phù|trữ\s+vật|hồ\s+lô|bảo\s+tháp|cổ\s+kính|hồn\s+đăng|linh\s+tửu|linh\s+trà|quyết|công\s+pháp|tâm\s+pháp|thân\s+pháp|kiếm\s+pháp|đao\s+pháp|chưởng\s+pháp|quyền\s+pháp|bộ\s+pháp|chỉ\s+pháp|khinh\s+công|nội\s+công|thần\s+công|tà\s+công|đại\s+pháp|bảo\s+điển|thần\s+điển|nhật\s+nguyệt\s+giám|chân\s+kinh|tâm\s+kinh|thần\s+quyết|bí\s+thuật|đạo\s+thuật|pháp\s+thuật|thần\s+thông|chiêu\s+thức|tuyệt\s+học|bí\s+tịch|kiếm\s+ý|đao\s+ý|kiếm\s+khí|đao\s+khí|chưởng\s+phong|quyền\s+phong|kiếm\s+ảnh|đao\s+ảnh|tàn\s+ảnh|huyễn\s+ảnh|sát\s+khí|cấm\s+chế|kết\s+giới|chưởng|quyền|trảo|cước|kình|thức|chiêu|trảm|tụ\s+linh|dẫn\s+khí|ngưng\s+thần|thổ\s+nạp|vận\s+công|tẩy\s+tủy|dưỡng\s+thần|hộ\s+mạch|tĩnh\s+âm)$/iu;
 
-// Unconditional location / sect / market / building trailing suffixes (NEVER a human given name)
+// Unconditional location / sect / market / building / mountain-compound trailing suffixes (NEVER a human given name)
 const XIANXIA_LOCATION_OR_SECT_SUFFIX_RE =
-  /(?:^|\s)(?:phường\s+thị|tửu\s+lầu|khách\s+điếm|động\s+phủ|bí\s+cảnh|linh\s+mạch|tông\s+môn|sơn\s+môn|tiệm\s+đan|đan\s+các|bảo\s+các|tàng\s+kinh\s+các|linh\s+điện|đại\s+điện|thương\s+hội|cổ\s+thành|hắc\s+thị|dược\s+viên|sơn\s+cốc|hàn\s+đàm|linh\s+tuyền|phúc\s+địa|động\s+thiên|tùng\s+lâm|thâm\s+uyên|yêu\s+sơn|linh\s+sơn|tiên\s+sơn|thánh\s+địa|cấm\s+địa|di\s+tích|cổ\s+mộ|phường|tông|môn|phái|bang|giáo|các|lầu|điện|viện|phủ|cung|đàn|trại|động|cốc|trấn|thôn|đảo|đầm|uyên|vực|giới|trì|núi|rừng|suối|thác|hang|chợ|tiệm|quán)$/iu;
+  /(?:^|\s)(?:phường\s+thị|tửu\s+lầu|tửu\s+quán|trà\s+quán|khách\s+điếm|động\s+phủ|bí\s+cảnh|linh\s+mạch|tông\s+môn|sơn\s+môn|tiệm\s+đan|đan\s+các|bảo\s+các|tàng\s+kinh\s+các|tàng\s+thư\s+các|linh\s+điện|đại\s+điện|bảo\s+điện|thương\s+hội|cổ\s+thành|hắc\s+thị|dược\s+viên|sơn\s+mạch|sơn\s+cốc|sơn\s+lĩnh|sơn\s+phong|sơn\s+trang|sơn\s+đạo|sơn\s+khẩu|sơn\s+lâm|sơn\s+dã|sơn\s+cước|đoạn\s+sơn|thâm\s+sơn|hoang\s+sơn|cổ\s+sơn|ma\s+sơn|thần\s+sơn|thánh\s+sơn|huyền\s+sơn|tuyết\s+sơn|hỏa\s+sơn|huyết\s+sơn|yêu\s+sơn|linh\s+sơn|tiên\s+sơn|hậu\s+sơn|hiệp\s+cốc|bình\s+nguyên|cao\s+nguyên|thảo\s+nguyên|hoang\s+mạc|sa\s+mạc|đại\s+mạc|băng\s+nguyên|tuyết\s+nguyên|cổ\s+lâm|u\s+lâm|mật\s+lâm|hàn\s+đàm|linh\s+tuyền|phúc\s+địa|động\s+thiên|tùng\s+lâm|thâm\s+uyên|thánh\s+địa|cấm\s+địa|di\s+tích|cổ\s+mộ|đoạn\s+nhai|tuyệt\s+bích|quan\s+ải|cửa\s+ải|đại\s+đạo|quan\s+đạo|cổ\s+đạo|thạch\s+kiều|võ\s+đài|lôi\s+đài|nội\s+môn|ngoại\s+môn|nghị\s+sự\s+đường|chấp\s+pháp\s+đường|công\s+đức\s+đường|phường|tông|môn|phái|bang|giáo|các|lầu|điện|viện|phủ|cung|đàn|trại|động|cốc|trấn|thôn|đảo|đầm|uyên|vực|giới|trì|núi|rừng|suối|thác|hang|chợ|tiệm|quán)$/iu;
+
+// Surname-gated geographic / mountain / river / landmark trailing suffixes
+// (Rejected whenever the first word is NOT a real personal surname or starts with a geographic/elemental descriptor — e.g. "Hoành Đoạn Sơn", "Hắc Phong Lĩnh", "Đoạn Hồn Nhai"; preserves surnamed characters like "Mạnh Thiết Sơn", "Lục Thanh Hà")
+const XIANXIA_SURNAME_GATED_LOCATION_SUFFIX_RE =
+  /(?:^|\s)(?:sơn|lĩnh|cương|nhai|khê|xuyên|giang|hà|hải|hồ|ao|bến|đèo|ải|quan|thành|lộ|kiều|đài|tháp|tự|miếu|đình|am|lâm|nguyên|mạc|pha|hạng|dã|bích)$/iu;
+
+// Diacritic-exact non-surname geographic / elemental / descriptive first words
+// (Distinguishes e.g. "Trường Bạch Sơn" / "Đoạn Hồn Nhai" / "Hoành Đoạn Sơn" from real surnames "Trương" / "Đoàn" / "Mạnh")
+const XIANXIA_GEO_NON_SURNAME_FIRST_RAW_RE =
+  /^(?:hoành|đoạn|trường|hoang|thâm|tuyệt|vọng|bách|vạn|thiên|địa|huyền|thái|cửu|thất|ngũ|tứ|tam|nhị|nhất|hắc|xích|huyết|băng|hỏa|lôi|cổ|tiên|thần|ma|yêu|đại|tiểu|côn|nga|tung|võ|u|thiết|tuyết|ngọc|thanh|linh|mộ|hàn)$/iu;
+
+// Scenery / weather / environment / scene-description fragments mistaken for NPCs
+const SCENE_DESCRIPTION_OR_WEATHER_FRAGMENT_RE =
+  /^(?:(?:ánh|tia|luồng|làn|cơn|đám|màn|bóng|ngọn|đỉnh|chân|vách|hẻm|dãy|bờ|mặt|dòng|con|khu|cánh|mảnh|vùng|bầu|biển|trời|đất|khung|bối|hiện|chiến)\s+(?:trăng|nắng|sáng|sao|gió|mưa|mây|sương|khói|bụi|tối|đêm|lửa|núi|đá|sông|suối|hồ|nước|rừng|cây|cỏ|đường|lối|trời|đất|cảnh|trường)|(?:sương\s+mù|mây\s+mù|gió\s+lạnh|mưa\s+phùn|bóng\s+đêm|màn\s+đêm|hoàng\s+hôn|bình\s+minh|rạng\s+đông|cảnh\s+vật|khung\s+cảnh|bối\s+cảnh|không\s+gian|thời\s+gian|hiện\s+trường|chiến\s+trường|lối\s+mòn|con\s+đường|khu\s+rừng|đỉnh\s+núi|chân\s+núi|vách\s+đá|hẻm\s+núi|dãy\s+núi|vực\s+sâu))$/iu;
 
 // Poetic / elemental / numerical / cultivation first words that are NOT personal surnames
 const XIANXIA_POETIC_NON_SURNAME_FIRST_RE =
-  /^(?:linh|thanh|bách|vạn|thiên|địa|huyền|thái|cửu|thất|ngũ|tứ|tam|nhị|nhất|hắc|xích|tử|huyết|băng|hỏa|lôi|ngân|ngọc|cổ|tiên|thần|ma|yêu|tĩnh|ngưng|tụ|dẫn|ngự|trảm|phá|hộ|tẩy|dưỡng|bổ|hồi|phi|luyện|trúc|hóa|hợp|độ|thương|cực|vô|bất|tuyệt|độc|khai|chân|nguyên|bát|thập)$/iu;
+  /^(?:linh|thanh|bách|vạn|thiên|địa|huyền|thái|cửu|thất|ngũ|tứ|tam|nhị|nhất|hắc|xích|tử|huyết|băng|hỏa|lôi|ngân|ngọc|cổ|tiên|thần|ma|yêu|tĩnh|ngưng|tụ|dẫn|ngự|trảm|phá|hộ|tẩy|dưỡng|bổ|hồi|phi|luyện|trúc|hóa|hợp|độ|thương|cực|vô|bất|tuyệt|độc|khai|chân|nguyên|bát|thập|hoành|đoạn)$/iu;
 
 // Second/trailing world-concept words that when combined with a poetic non-surname prefix form an item/place/technique/nature term
 const XIANXIA_WORLD_CONCEPT_END_RE =
-  /^(?:sơn|lâm|tùng|trúc|mai|lan|cúc|sương|tuyết|vân|phong|vũ|lôi|điện|hỏa|băng|thủy|mộc|thổ|kim|ngọc|bảo|đan|kiếm|đao|phù|trận|tháp|các|lầu|tông|môn|đạo|pháp|quyết|công|kinh|khí|lực|hồn|thần|linh|mạch|đàm|tuyền|hải|giang|hà|cốc|động|phủ|thành|trấn|thị|phường|bình|âm|quang|ảnh|châu|liên|hoa|thảo|quả|thạch|tủy|dịch|lộ|giáp|bào|đỉnh|lô|ấn|kính|đăng|cầm|sáo|tiêu|cảnh|giới|vực|tầng|kỳ|giai|trọng|phẩm|ý|tâm|mộc|tuyền|nguyệt)$/iu;
+  /^(?:sơn|lĩnh|lâm|tùng|trúc|mai|lan|cúc|sương|tuyết|vân|phong|vũ|lôi|điện|hỏa|băng|thủy|mộc|thổ|kim|ngọc|bảo|đan|kiếm|đao|phù|trận|tháp|các|lầu|tông|môn|đạo|pháp|quyết|công|kinh|khí|lực|hồn|thần|linh|mạch|đàm|tuyền|hải|giang|hà|cốc|động|phủ|thành|trấn|thị|phường|bình|âm|quang|ảnh|châu|liên|hoa|thảo|quả|thạch|tủy|dịch|lộ|giáp|bào|đỉnh|lô|ấn|kính|đăng|cầm|sáo|tiêu|cảnh|giới|vực|tầng|kỳ|giai|trọng|phẩm|ý|tâm|nguyệt|nhai|khê|xuyên|quan|ải|đèo|đài|kiều|mạc|nguyên|pha|bích)$/iu;
 
 const XIANXIA_WORLD_CONCEPT_ANY_TOKEN_RE =
-  /(?:^|\s)(?:kiếm|đao|phù|bùa|đan|dược|lôi|băng|hỏa|trận|tông|môn|các|lầu|điện|phủ|sơn|hải|thiên|địa|linh|khí|thần|quyết|công|pháp|kinh|chưởng|quyền|chỉ|trảo|ý|vực|cảnh|tầng|thạch|thảo|liên|bảo|ngọc|mạch|tủy|giáp|bào|đỉnh|lô|tháp|ấn|phường|thị|tùng|sương|tụ|ngưng|dẫn|ngự|tẩy|dưỡng|tĩnh|luyện|trúc|hóa|độ)(?:\s|$)/iu;
+  /(?:^|\s)(?:kiếm|đao|phù|bùa|đan|dược|lôi|băng|hỏa|trận|tông|môn|các|lầu|điện|phủ|sơn|lĩnh|nhai|khê|xuyên|hải|thiên|địa|linh|khí|thần|quyết|công|pháp|kinh|chưởng|quyền|chỉ|trảo|ý|vực|cảnh|tầng|thạch|thảo|liên|bảo|ngọc|mạch|tủy|giáp|bào|đỉnh|lô|tháp|ấn|phường|thị|tùng|sương|tụ|ngưng|dẫn|ngự|tẩy|dưỡng|tĩnh|luyện|trúc|hóa|độ|đoạn|mạc|nguyên)(?:\s|$)/iu;
 
 /**
  * Extracts normalized keys from the player's own cultivation profile (realms, techniques, moves,
@@ -2999,7 +3157,13 @@ export function isNonPersonCultivationOrWorldTerm(
   rawName: string,
   extraBlockedKeys?: Set<string>,
 ): boolean {
-  const cleaned = String(rawName || '')
+  const rawTrimmed = String(rawName || '').trim();
+  if (!rawTrimmed) return true;
+  if (isShortCodeOrBracketedJunkName(rawTrimmed)) {
+    return true;
+  }
+
+  const cleaned = rawTrimmed
     .replace(/[*_`~#<>]+/g, '')
     .replace(/^[\s"'“”‘’(\[.,!?;:–—-]+|[\s"'“”‘’.,!?;:)\[\]–—-]+$/g, '')
     .replace(/\s+/g, ' ')
@@ -3023,6 +3187,10 @@ export function isNonPersonCultivationOrWorldTerm(
     return true;
   }
 
+  if (SCENE_DESCRIPTION_OR_WEATHER_FRAGMENT_RE.test(cleaned)) {
+    return true;
+  }
+
   // Cultivation realms, stages, meridians, and tier labels
   if (
     XIANXIA_REALM_OR_STAGE_RE.test(cleaned) ||
@@ -3041,6 +3209,29 @@ export function isNonPersonCultivationOrWorldTerm(
 
   const rawWords = cleaned.split(/\s+/).filter(Boolean);
   const tokens = key.split(/\s+/).filter(Boolean);
+
+  // Geographic / mountain / river / landmark trailing suffixes (e.g. "Hoành Đoạn Sơn", "Trường Bạch Sơn", "Hắc Phong Lĩnh", "Đoạn Hồn Nhai")
+  // Preserves genuine surnamed characters like "Mạnh Thiết Sơn", "Lục Thanh Hà", "Trương Bảo Sơn".
+  if (
+    rawWords.length >= 2 &&
+    XIANXIA_SURNAME_GATED_LOCATION_SUFFIX_RE.test(cleaned)
+  ) {
+    const firstTok = tokens[0] || '';
+    const secondTok = tokens[1] || '';
+    const isCompassGeoStart =
+      /^(?:dong|tay|nam|bac)$/i.test(firstTok) &&
+      !/^(?:phuong|cung|mon|duong)$/i.test(secondTok);
+    const startsWithNonSurnameGeoWord = XIANXIA_GEO_NON_SURNAME_FIRST_RAW_RE.test(
+      rawWords[0] || '',
+    );
+    const hasGenuineSurnameStart =
+      ALL_PERSON_SURNAME_KEYS.has(firstTok) &&
+      !isCompassGeoStart &&
+      !startsWithNonSurnameGeoWord;
+    if (!hasGenuineSurnameStart) {
+      return true;
+    }
+  }
 
   // Pills ending in "Đan" (e.g. "Linh Đan", "Tụ Linh Đan", "Trúc Cơ Đan", "Hồi Xuân Đan")
   // Preserve 3+ word personal names starting with a real surname (e.g. "Trần Linh Đan"),
@@ -3093,7 +3284,7 @@ export function isNonPersonCultivationOrWorldTerm(
   // Single-word cultivation/world terms that are never standalone NPC names
   if (
     rawWords.length === 1 &&
-    /^(?:kiếm|đao|phù|bùa|đan|dược|thạch|thảo|trận|tông|phường|tầng|cảnh|quyết|pháp|giáp|bào|đỉnh|lô|tùng|sương|linh|thiên|địa|huyền|thái|bách|vạn)$/iu.test(
+    /^(?:kiếm|đao|phù|bùa|đan|dược|thạch|thảo|trận|tông|phường|tầng|cảnh|quyết|pháp|giáp|bào|đỉnh|lô|tùng|sương|linh|thiên|địa|huyền|thái|bách|vạn|sơn|lĩnh|cốc|động|nhai|khê|mạc)$/iu.test(
       rawWords[0] || '',
     )
   ) {
@@ -3747,6 +3938,7 @@ export function findCanonicalVariantMatch(
   if (!cleanCand || cleanCand.length < 2) return null;
   const candKey = normalizeCharacterKey(cleanCand);
   if (!candKey) return null;
+  const candTokens = candKey.split(/\s+/).filter(Boolean);
 
   const candId = collectCharacterIdentityKeys(cleanCand);
   let bestMatch: string | null = null;
@@ -3757,16 +3949,40 @@ export function findCanonicalVariantMatch(
     if (!canon) continue;
     const canonKey = normalizeCharacterKey(canon);
     if (!canonKey || canonKey === candKey) continue;
-    // Never map a clean name onto a teasing/parody name
-    if (isPlayfulTeasingOrParodyName(canon)) continue;
+    // Never map a clean name onto a teasing/parody name or non-person junk
+    if (
+      isPlayfulTeasingOrParodyName(canon) ||
+      isShortCodeOrBracketedJunkName(canon)
+    ) {
+      continue;
+    }
+
+    const canonTokens = canonKey.split(/\s+/).filter(Boolean);
+    const isGivenNameTailOfCanon = isShortenedTailOfFullNameKey(
+      candKey,
+      canonKey,
+    );
+    // Never downgrade a longer surnamed full name onto its shorter tail (e.g. never map "Lục Vô Trần" -> "Vô Trần")
+    if (isShortenedTailOfFullNameKey(canonKey, candKey)) {
+      continue;
+    }
 
     const canonId = collectCharacterIdentityKeys(canon);
-    const isShadow = areIdentityKeysShadowMatch(candId.aliasKeys, canonId.aliasKeys);
+    const isShadow =
+      isGivenNameTailOfCanon ||
+      areIdentityKeysShadowMatch(candId.aliasKeys, canonId.aliasKeys);
     const isVariant = isShadow || isTeasingOrSpellingVariantOf(cleanCand, canon);
     if (!isVariant) continue;
 
+    // Prefer fuller surnamed canonical names over shorter partial names
+    const canonHasMoreWords = canonTokens.length > candTokens.length;
+    const canonStartsWithSurname = ALL_PERSON_SURNAME_KEYS.has(
+      canonTokens[0] || '',
+    );
     const score =
-      (isShadow ? 20 : 10) +
+      (isGivenNameTailOfCanon ? 30 : isShadow ? 20 : 10) +
+      (canonHasMoreWords ? 8 : 0) +
+      (canonStartsWithSurname ? 4 : 0) +
       (lookupKnownCelebrityProfile(canon) ? 8 : 0) +
       (canon.includes(' ') ? 5 : 0) +
       Math.min(5, canon.length / 4);
@@ -4031,10 +4247,15 @@ export function sanitizeCharacterName(
   allowedKnownKeys?: Set<string>,
   extraBlockedKeys?: Set<string>,
 ): string | null {
-  let name = String(rawName || '')
+  const rawCleaned = String(rawName || '')
     .replace(/[*_`~#<>]+/g, '')
     .replace(/\s+/g, ' ')
     .trim();
+  if (!rawCleaned || isShortCodeOrBracketedJunkName(rawCleaned)) {
+    return null;
+  }
+
+  let name = rawCleaned;
 
   // Handle parenthetical aliases like "Nguyễn Hoàng Long (Low G)" BEFORE stripping outer punctuation/brackets
   if (name.includes('(') && name.includes(')')) {
@@ -4050,6 +4271,7 @@ export function sanitizeCharacterName(
     .trim();
 
   if (!name || name.length < 2 || name.length > 42) return null;
+  if (isShortCodeOrBracketedJunkName(name)) return null;
 
   // Reject anything containing internal line breaks, brackets, slashes, or sentence punctuation
   if (/[\r\n()\[\]{};:!?/\\|@#$%^&*+=~]/.test(name)) {
@@ -4347,23 +4569,59 @@ export function collectCharacterIdentityKeys(
   return { primaryKey, aliasKeys };
 }
 
-function areIdentityKeysShadowMatch(aKeys: Set<string>, bKeys: Set<string>): boolean {
+/**
+ * Returns true if `shortKey` is a shortened given-name tail of a longer surnamed full name `fullKey`
+ * (e.g. "vo tran" -> "luc vo tran", "hoai can" -> "to hoai can", "thiet son" -> "manh thiet son").
+ */
+export function isShortenedTailOfFullNameKey(
+  shortKey: string,
+  fullKey: string,
+): boolean {
+  const s = String(shortKey || '').trim();
+  const f = String(fullKey || '').trim();
+  if (!s || !f || s === f || s.length >= f.length) return false;
+  const sTokens = s.split(/\s+/).filter(Boolean);
+  const fTokens = f.split(/\s+/).filter(Boolean);
+  if (fTokens.length <= sTokens.length) return false;
+  // 2-word given-name tail of a 3+ word surnamed full name (e.g. "vo tran" in "luc vo tran")
+  if (
+    sTokens.length === 2 &&
+    fTokens.length >= 3 &&
+    ALL_PERSON_SURNAME_KEYS.has(fTokens[0] || '') &&
+    f.endsWith(` ${s}`)
+  ) {
+    return true;
+  }
+  // 1-word given-name tail of a 2+ word full name (e.g. "wonyoung" in "jang wonyoung", "jennie" in "jennie kim")
+  if (
+    sTokens.length === 1 &&
+    s.length >= 4 &&
+    fTokens.length >= 2 &&
+    (f.startsWith(`${s} `) || f.endsWith(` ${s}`))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+export function areIdentityKeysShadowMatch(
+  aKeys: Set<string>,
+  bKeys: Set<string>,
+): boolean {
   for (const ak of aKeys) {
     if (bKeys.has(ak)) return true;
   }
-  // Check single-word / short given-name shadow of a fuller multi-word name (e.g. "Wonyoung" <-> "Jang Wonyoung", "Jennie" <-> "Jennie Kim")
+  // Check 1-word or 2-word given-name shadow of a fuller multi-word name
+  // (e.g. "Wonyoung" <-> "Jang Wonyoung", "Vô Trần" <-> "Lục Vô Trần", "Hoài Cẩn" <-> "Tô Hoài Cẩn")
   for (const ak of aKeys) {
     if (ak.length < 4) continue;
     for (const bk of bKeys) {
       if (bk.length < 4) continue;
-      const aHasSpace = ak.includes(' ');
-      const bHasSpace = bk.includes(' ');
-      if (aHasSpace !== bHasSpace) {
-        const full = aHasSpace ? ak : bk;
-        const short = aHasSpace ? bk : ak;
-        if (full.startsWith(`${short} `) || full.endsWith(` ${short}`)) {
-          return true;
-        }
+      if (
+        isShortenedTailOfFullNameKey(ak, bk) ||
+        isShortenedTailOfFullNameKey(bk, ak)
+      ) {
+        return true;
       }
       if (
         isTeasingOrSpellingVariantOf(ak, bk) ||
@@ -4484,7 +4742,7 @@ export function classifySuspiciousPortraitJunk(
     | 'appearanceManual'
     | 'npcId'
   > &
-    Partial<Pick<CharacterPortrait, 'imageData'>>,
+    Partial<Pick<CharacterPortrait, 'imageData' | 'referenceImageData'>>,
   allowedKnownKeys?: Set<string>,
   allPortraits?: Array<Pick<CharacterPortrait, 'id' | 'name' | 'isMc'>>,
   extraBlockedKeys?: Set<string>,
@@ -4492,7 +4750,10 @@ export function classifySuspiciousPortraitJunk(
   if (p.isMc) return null;
   const rawName = String(p.name || '').trim();
   if (!rawName) return 'non_person';
-  if (isNonPersonCultivationOrWorldTerm(rawName, extraBlockedKeys)) {
+  if (
+    isShortCodeOrBracketedJunkName(rawName) ||
+    isNonPersonCultivationOrWorldTerm(rawName, extraBlockedKeys)
+  ) {
     return 'non_person';
   }
   if (isLyricOrExclamationJunkName(rawName, allowedKnownKeys)) {
@@ -4507,23 +4768,31 @@ export function classifySuspiciousPortraitJunk(
   ) {
     return 'teasing_alias';
   }
-  if (!isUserProtected && allPortraits && allPortraits.length > 1) {
+  if (allPortraits && allPortraits.length > 1) {
+    // Include MC as well so a shortened tail of MC's full name (e.g. "Vô Trần" when MC is "Lục Vô Trần") is caught
     const otherNames = allPortraits
-      .filter((o) => o.id !== p.id && !o.isMc && o.name?.trim())
+      .filter((o) => o.id !== p.id && o.name?.trim())
       .map((o) => o.name.trim());
     const canonicalHit = findCanonicalVariantMatch(rawName, otherNames);
     if (canonicalHit) {
       const candKey = normalizeCharacterKey(rawName);
       const canonKey = normalizeCharacterKey(canonicalHit);
-      const candIsCeleb = Boolean(lookupKnownCelebrityProfile(rawName));
-      const canonIsCeleb = Boolean(lookupKnownCelebrityProfile(canonicalHit));
-      const candLooksMoreAlias =
-        isPlayfulTeasingOrParodyName(rawName) ||
-        (!candIsCeleb && canonIsCeleb) ||
-        (!candKey.includes(' ') && canonKey.includes(' ')) ||
-        isPortraitAutoScannedUnconfirmed(p);
-      if (candLooksMoreAlias) {
+      const isTailOfFull = isShortenedTailOfFullNameKey(candKey, canonKey);
+      const hasCustomUserImage = Boolean(p.imageData || p.referenceImageData);
+      if (isTailOfFull && (!isUserProtected || !hasCustomUserImage)) {
         return 'teasing_alias';
+      }
+      if (!isUserProtected) {
+        const candIsCeleb = Boolean(lookupKnownCelebrityProfile(rawName));
+        const canonIsCeleb = Boolean(lookupKnownCelebrityProfile(canonicalHit));
+        const candLooksMoreAlias =
+          isPlayfulTeasingOrParodyName(rawName) ||
+          (!candIsCeleb && canonIsCeleb) ||
+          (!candKey.includes(' ') && canonKey.includes(' ')) ||
+          isPortraitAutoScannedUnconfirmed(p);
+        if (candLooksMoreAlias) {
+          return 'teasing_alias';
+        }
       }
     }
   }
@@ -4626,17 +4895,18 @@ export function buildAllowedRosterKeys(
   const keys = new Set<string>();
   const add = (s?: string) => {
     const raw = String(s || '').trim();
-    if (!raw) return;
+    if (!raw || isShortCodeOrBracketedJunkName(raw)) return;
     const { baseName } = splitNameAndParentheticalAliases(raw);
     const k = normalizeCharacterKey(baseName);
     if (!k || k.length < 2) return;
-    // Never whitelist blatant non-person or lyric/exclamation junk even if it leaked into a legacy companion profile
+    // Never whitelist blatant non-person, geographic, abbreviation, or lyric/exclamation junk even if it leaked into a legacy companion profile
     if (
       JUNK_EXACT_PHRASES.has(k) ||
       STRICT_NON_PERSON_SUBSTRING_RE.test(k) ||
       STRICT_VI_NON_PERSON_PREFIX_RE.test(baseName) ||
       STRICT_VI_COMPASS_OR_GEO_EXACT_RE.test(baseName) ||
       STRICT_VI_NON_NAME_TOKEN_RE.test(baseName) ||
+      isNonPersonCultivationOrWorldTerm(baseName) ||
       isLyricOrExclamationJunkName(baseName) ||
       isPlayfulTeasingOrParodyName(baseName) ||
       isChatOrNonPersonDescription(baseName)
@@ -4651,6 +4921,15 @@ export function buildAllowedRosterKeys(
   for (const n of comp?.npcs || []) add(n.name);
   for (const c of comp?.canonCandidates || []) add(c.name);
   for (const extra of extraValidNames || []) add(extra);
+
+  // Drop shortened given-name tail keys (e.g. "vo tran") whenever a fuller surnamed name (e.g. "luc vo tran") is in the roster
+  const allKeyList = Array.from(keys);
+  for (const k of allKeyList) {
+    if (allKeyList.some((other) => other !== k && isShortenedTailOfFullNameKey(k, other))) {
+      keys.delete(k);
+    }
+  }
+
   return keys;
 }
 
@@ -5112,11 +5391,24 @@ function mergeTwoPortraits(
   const incomingParody = isPlayfulTeasingOrParodyName(incoming.name);
   const targetCeleb = Boolean(lookupKnownCelebrityProfile(target.name));
   const incomingCeleb = Boolean(lookupKnownCelebrityProfile(incoming.name));
+  const targetWords = target.name.trim().split(/\s+/).filter(Boolean).length;
+  const incomingWords = incoming.name.trim().split(/\s+/).filter(Boolean).length;
+  const targetHasSurname = hasPersonSurnameStart(target.name);
+  const incomingHasSurname = hasPersonSurnameStart(incoming.name);
+  const targetKey = normalizeCharacterKey(target.name);
+  const incomingKey = normalizeCharacterKey(incoming.name);
+  const targetIsTailOfIncoming = isShortenedTailOfFullNameKey(
+    targetKey,
+    incomingKey,
+  );
   const preferIncomingName =
     !target.isMc &&
     !incomingParody &&
     (targetParody ||
+      targetIsTailOfIncoming ||
       (!targetCeleb && incomingCeleb) ||
+      (incomingWords > targetWords &&
+        (incomingHasSurname || !targetHasSurname || targetWords === 1)) ||
       (incoming.name.trim().includes(' ') && !target.name.trim().includes(' ')));
   const pickText = (a?: string, b?: string) => {
     const ca = String(a || '').trim();
@@ -5226,15 +5518,45 @@ export function cleanJunkPortraitsFromBank(
   comp?: CompanionProfile,
   fallbackMcName?: string,
   extraBlockedKeys?: Set<string>,
+  options?: { aggressiveJunkClean?: boolean },
 ): { bank: PortraitBankConfig; removedNames: string[] } {
   const allowedKeys = buildAllowedRosterKeys(comp, fallbackMcName);
+  const aggressiveJunkClean = Boolean(options?.aggressiveJunkClean);
   const removedNames: string[] = [];
   const kept: Array<{
     portrait: CharacterPortrait;
     identity: { primaryKey: string; aliasKeys: Set<string> };
   }> = [];
 
-  for (const rawPortrait of bank.portraits || []) {
+  const mcCanonicalName = String(
+    comp?.mc?.name || fallbackMcName || '',
+  ).trim();
+  const mcCanonicalKey = normalizeCharacterKey(mcCanonicalName);
+
+  // Process MC first, then longer surnamed full names BEFORE shorter partial/tail names
+  // so e.g. "Lục Vô Trần" is always registered before "Vô Trần" and absorbs it cleanly.
+  const orderedInput = [...(bank.portraits || [])].sort((a, b) => {
+    const aMc = a?.isMc ? 1 : 0;
+    const bMc = b?.isMc ? 1 : 0;
+    if (aMc !== bMc) return bMc - aMc;
+    const aName = String(a?.name || '').trim();
+    const bName = String(b?.name || '').trim();
+    const aWords = aName.split(/\s+/).filter(Boolean).length;
+    const bWords = bName.split(/\s+/).filter(Boolean).length;
+    const aFullScore =
+      (aWords >= 3 && hasPersonSurnameStart(aName) ? 20 : 0) +
+      aWords * 3 +
+      (a?.imageData ? 2 : 0) +
+      (a?.pinned ? 1 : 0);
+    const bFullScore =
+      (bWords >= 3 && hasPersonSurnameStart(bName) ? 20 : 0) +
+      bWords * 3 +
+      (b?.imageData ? 2 : 0) +
+      (b?.pinned ? 1 : 0);
+    return bFullScore - aFullScore;
+  });
+
+  for (const rawPortrait of orderedInput) {
     if (!rawPortrait || !rawPortrait.name?.trim()) continue;
 
     if (rawPortrait.isMc) {
@@ -5278,7 +5600,10 @@ export function cleanJunkPortraitsFromBank(
       continue;
     }
 
-    if (isInvalidNpcPortrait(rawPortrait, allowedKeys, extraBlockedKeys)) {
+    if (
+      isShortCodeOrBracketedJunkName(rawPortrait.name) ||
+      isInvalidNpcPortrait(rawPortrait, allowedKeys, extraBlockedKeys)
+    ) {
       removedNames.push(rawPortrait.name);
       continue;
     }
@@ -5289,6 +5614,24 @@ export function cleanJunkPortraitsFromBank(
       extraBlockedKeys,
     );
     if (!sanitizedName) {
+      removedNames.push(rawPortrait.name);
+      continue;
+    }
+
+    // Drop any non-MC portrait whose name is a shortened tail of MC's full name (e.g. "Vô Trần" when MC is "Lục Vô Trần")
+    const sanitizedKey = normalizeCharacterKey(sanitizedName);
+    if (
+      mcCanonicalKey &&
+      (sanitizedKey === mcCanonicalKey ||
+        isShortenedTailOfFullNameKey(sanitizedKey, mcCanonicalKey))
+    ) {
+      const existingMcIdx = kept.findIndex((k) => k.portrait.isMc);
+      if (existingMcIdx >= 0) {
+        kept[existingMcIdx].portrait = mergeTwoPortraits(
+          kept[existingMcIdx].portrait,
+          { ...rawPortrait, name: sanitizedName, isMc: false },
+        );
+      }
       removedNames.push(rawPortrait.name);
       continue;
     }
@@ -5361,6 +5704,19 @@ export function cleanJunkPortraitsFromBank(
       for (const ak of identity.aliasKeys) {
         kept[dupIdx].identity.aliasKeys.add(ak);
       }
+      removedNames.push(rawPortrait.name);
+      continue;
+    }
+
+    if (
+      aggressiveJunkClean &&
+      classifySuspiciousPortraitJunk(
+        normalizedPortrait,
+        allowedKeys,
+        orderedInput,
+        extraBlockedKeys,
+      ) !== null
+    ) {
       removedNames.push(rawPortrait.name);
       continue;
     }
@@ -5529,14 +5885,33 @@ export function cleanAndDeduplicateCharacterStates(
  * Cleans invalid non-person entries and duplicates from a CompanionProfile's NPC array
  * while preserving legitimate user-defined NPCs.
  */
-export function cleanJunkCompanionNpcs(npcs: CompanionNpc[]): CompanionNpc[] {
+export function cleanJunkCompanionNpcs(
+  npcs: CompanionNpc[],
+  options?: { mcName?: string; extraBlockedKeys?: Set<string> },
+): CompanionNpc[] {
   const kept: Array<{
     npc: CompanionNpc;
     identity: { primaryKey: string; aliasKeys: Set<string> };
   }> = [];
+  const mcKey = normalizeCharacterKey(options?.mcName || '');
+  const mcIdentity = mcKey
+    ? collectCharacterIdentityKeys(options?.mcName || '')
+    : null;
 
-  for (const npc of npcs || []) {
+  // Sort longer surnamed full names ahead of shorter tail names so e.g. "Lục Vô Trần" is kept and "Vô Trần" is dropped
+  const orderedNpcs = [...(npcs || [])].sort((a, b) => {
+    const aName = String(a?.name || '').trim();
+    const bName = String(b?.name || '').trim();
+    const aWords = aName.split(/\s+/).filter(Boolean).length;
+    const bWords = bName.split(/\s+/).filter(Boolean).length;
+    const aScore = (aWords >= 3 && hasPersonSurnameStart(aName) ? 20 : 0) + aWords * 3;
+    const bScore = (bWords >= 3 && hasPersonSurnameStart(bName) ? 20 : 0) + bWords * 3;
+    return bScore - aScore;
+  });
+
+  for (const npc of orderedNpcs) {
     if (!npc || !npc.name?.trim()) continue;
+    if (isShortCodeOrBracketedJunkName(npc.name)) continue;
     const { baseName } = splitNameAndParentheticalAliases(npc.name);
     const key = normalizeCharacterKey(baseName);
     if (
@@ -5546,6 +5921,7 @@ export function cleanJunkCompanionNpcs(npcs: CompanionNpc[]): CompanionNpc[] {
       STRICT_VI_NON_PERSON_PREFIX_RE.test(baseName) ||
       STRICT_VI_COMPASS_OR_GEO_EXACT_RE.test(baseName) ||
       STRICT_VI_NON_NAME_TOKEN_RE.test(baseName) ||
+      isNonPersonCultivationOrWorldTerm(baseName, options?.extraBlockedKeys) ||
       isLyricOrExclamationJunkName(baseName) ||
       isPlayfulTeasingOrParodyName(baseName) ||
       isChatOrNonPersonDescription(baseName) ||
@@ -5560,6 +5936,14 @@ export function cleanJunkCompanionNpcs(npcs: CompanionNpc[]): CompanionNpc[] {
       npc.role,
       npc.signature,
     ]);
+    // Never keep an NPC that is just a shortened tail or shadow of MC's name
+    if (
+      mcIdentity &&
+      (areIdentityKeysShadowMatch(mcIdentity.aliasKeys, identity.aliasKeys) ||
+        (mcKey && isShortenedTailOfFullNameKey(key, mcKey)))
+    ) {
+      continue;
+    }
     const dupIdx = kept.findIndex(
       (k) =>
         areIdentityKeysShadowMatch(k.identity.aliasKeys, identity.aliasKeys) ||
@@ -5652,7 +6036,7 @@ export function extractVisualCuesForCharacter(
 }
 
 const ABSENCE_CUE_RE =
-  /(?:khong\s+co\s+mat|vang\s+mat|vang\s+bong|khong\s+o\s+(?:my|day|tai|bua\s+tiec|phong|canh|hien\s+truong|do|los\s+angeles|beverly|hollywood|bua\s+tiec)|khong\s+tham\s+du|khong\s+xuat\s+hien|chua\s+(?:toi|den|xuat\s+hien|co\s+mat|ve)|o\s+cach\s+xa|o\s+nua\s+vong\s+trai\s+dat|khong\s+di\s+cung|ngoai\s+canh|khong\s+lien\s+quan\s+den|bo\s+qua\s+nvc|khong\s+co\s+nvc|khong\s+co\s+nhan\s+vat\s+chinh|khong\s+dua\s+nvc|dang\s+o\s+(?:viet\s+nam|ha\s+noi|sai\s+gon|tp\s*hcm|han\s+quoc|seoul|nhat\s+ban|tokyo|london|paris|noi\s+khac|thanh\s+pho\s+khac|nha\s+rieng|que)|o\s+(?:thanh\s+pho\s+khac|noi\s+khac|ben\s+kia)|da\s+roi\s+(?:di|khoi)|vua\s+roi\s+(?:di|khoi)|chi\s+(?:nhac\s+den|nhac\s+toi|goi\s+dien|nhan\s+tin)|qua\s+(?:dien\s+thoai|tin\s+nhan|man\s+hinh)|not\s+present|absent|not\s+in\s+the\s+us|not\s+in\s+america|not\s+at\s+the\s+party|off-?screen|without\s+(?:the\s+)?mc)/i;
+  /(?:khong\s+co\s+mat|vang\s+mat|vang\s+bong|khong\s+o\s+(?:my|day|tai|bua\s+tiec|phong|canh|hien\s+truong|do|los\s+angeles|beverly|hollywood|bua\s+tiec)|khong\s+tham\s+du|khong\s+xuat\s+hien|chua\s+(?:toi|den|xuat\s+hien|co\s+mat|ve)|o\s+cach\s+xa|o\s+nua\s+vong\s+trai\s+dat|khong\s+di\s+cung|ngoai\s+canh|khong\s+lien\s+quan\s+den|bo\s+qua\s+nvc|khong\s+co\s+nvc|khong\s+co\s+nhan\s+vat\s+chinh|khong\s+dua\s+nvc|dang\s+o\s+(?:viet\s+nam|ha\s+noi|sai\s+gon|tp\s*hcm|han\s+quoc|seoul|nhat\s+ban|tokyo|london|paris|noi\s+khac|thanh\s+pho\s+khac|nha\s+rieng|que)|o\s+(?:thanh\s+pho\s+khac|noi\s+khac|ben\s+kia(?!\s+(?:ban|ghe|phong|san\s+khau|sanh|hanh\s+lang|quay|duong|cua|giuong|sofa|can\s+phong|khung\s+cua)))|da\s+roi\s+(?:di|khoi)|vua\s+roi\s+(?:di|khoi)|chi\s+(?:nhac\s+den|nhac\s+toi|goi\s+dien|nhan\s+tin)|qua\s+(?:dien\s+thoai|tin\s+nhan|man\s+hinh)|not\s+present|absent|not\s+in\s+the\s+us|not\s+in\s+america|not\s+at\s+the\s+party|off-?screen|without\s+(?:the\s+)?mc)/i;
 
 const GENERIC_MC_ABSENCE_RE =
   /(?:\b(?:nvc|mc|nhan\s+vat\s+chinh)\b[^.!?\n]{0,65}(?:khong\s+co\s+mat|vang\s+mat|vang\s+bong|khong\s+o\s+(?:my|day|tai|do|canh|bua\s+tiec)|khong\s+tham\s+du|khong\s+xuat\s+hien|chua\s+(?:toi|den)|ngoai\s+canh|not\s+present|absent|not\s+in\s+the\s+us|off-?screen)|(?:khong\s+co\s+mat|vang\s+mat|khong\s+co|bo\s+qua|khong\s+xuat\s+hien|without)\s+(?:cua\s+)?(?:nvc|mc|nhan\s+vat\s+chinh)\b)/i;
@@ -7661,6 +8045,87 @@ export function resolvePortraitRoleTier(
     tierLabel,
     detailLabel,
   };
+}
+
+const ACTIVE_MAIN_EXPLICIT_ROLE_RE =
+  /(?:^|\s|\/|·|-|:)(?:main|nhân\s*vật\s*chính|nv\s*chính|mc)(?:\s|$|\/|·|-|:)/i;
+
+const ACTIVE_MAIN_DEMOTED_ROLE_RE =
+  /(?:^|\s|\/|·|-|:)(?:npc|vai\s*phụ|nhân\s*vật\s*phụ|mob|quần\s*chúng|qua\s*đường|người\s*nền|vô\s*danh|tạp\s*nham|lính\s*lác)(?:\s|$|\/|·|-|:)/i;
+
+const GENERIC_MAIN_PLACEHOLDER_RE =
+  /^(?:nhân\s*vật\s*chính|nv\s*chính|mc|main|player|người\s*chơi|tôi|bạn)$/i;
+
+/**
+ * Xác định ID duy nhất của thẻ nhân vật chính ("Main") đang hoạt động trong danh sách chân dung.
+ * Các thẻ đã hạ xuống NPC hoặc Mob / Quần chúng (kể cả khi còn cờ cũ `isMc: true`, ví dụ "Lục Vô Trần")
+ * KHÔNG bao giờ được xem là thẻ Main được bảo vệ — nhờ đó luôn hiện nút "Xóa NV".
+ */
+export function resolveActiveMainPortraitId(
+  portraits: Array<Pick<CharacterPortrait, 'id' | 'name' | 'role' | 'isMc'>>,
+  activeMainName?: string | null,
+): string | null {
+  const list = Array.isArray(portraits) ? portraits : [];
+  if (!list.length) return null;
+
+  const isDemoted = (p: Pick<CharacterPortrait, 'role' | 'isMc'>): boolean => {
+    const role = String(p.role || '').trim();
+    if (ACTIVE_MAIN_DEMOTED_ROLE_RE.test(role)) return true;
+    const tier = resolvePortraitRoleTier(p).tier;
+    return tier === 'npc' || tier === 'mob';
+  };
+
+  const isExplicitMain = (p: Pick<CharacterPortrait, 'role' | 'isMc'>): boolean =>
+    !isDemoted(p) && ACTIVE_MAIN_EXPLICIT_ROLE_RE.test(String(p.role || '').trim());
+
+  const cleanTarget = String(activeMainName || '').trim();
+  const hasConcreteTarget =
+    Boolean(cleanTarget) && !GENERIC_MAIN_PLACEHOLDER_RE.test(cleanTarget);
+  const targetKey = hasConcreteTarget ? normalizeCharacterKey(cleanTarget) : '';
+
+  const matchesTarget = (name: string): boolean => {
+    if (!targetKey) return false;
+    const key = normalizeCharacterKey(name);
+    if (!key) return false;
+    return (
+      key === targetKey ||
+      areIdentityKeysShadowMatch(new Set([key]), new Set([targetKey]))
+    );
+  };
+
+  const nonDemoted = list.filter((p) => !isDemoted(p));
+  if (!nonDemoted.length) return null;
+
+  const explicitMains = nonDemoted.filter((p) => isExplicitMain(p));
+  if (explicitMains.length > 0) {
+    const chosen =
+      (hasConcreteTarget
+        ? explicitMains.find((p) => matchesTarget(p.name))
+        : undefined) ||
+      explicitMains.find((p) => p.isMc) ||
+      explicitMains[0];
+    return chosen.id;
+  }
+
+  const activeMcFlags = nonDemoted.filter((p) => p.isMc);
+  if (activeMcFlags.length > 0) {
+    const chosen =
+      (hasConcreteTarget
+        ? activeMcFlags.find((p) => matchesTarget(p.name))
+        : undefined) || activeMcFlags[0];
+    return chosen.id;
+  }
+
+  if (hasConcreteTarget) {
+    const byName = nonDemoted.find((p) => matchesTarget(p.name));
+    if (byName) return byName.id;
+    return null;
+  }
+
+  const tierMain = nonDemoted.find(
+    (p) => resolvePortraitRoleTier(p).tier === 'main',
+  );
+  return tierMain ? tierMain.id : null;
 }
 
 export function matchPortraitByName(
